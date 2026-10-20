@@ -38,7 +38,7 @@ jobs:
           dotnet-version: "8.0.x"
 
       - name: Locate application project
-        shell: pwsh
+        shell: powershell
         run: |
           $projects = @(
             Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter *.csproj -Recurse |
