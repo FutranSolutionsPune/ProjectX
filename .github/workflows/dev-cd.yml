@@ -24,7 +24,7 @@ jobs:
           name: ProjectX-${{ github.sha }}
           path: ${{ runner.temp }}\ProjectX-artifact
 
-      - name: Validate deployment package
+            - name: Validate deployment package
         shell: powershell
         run: |
           $zip = Join-Path $env:RUNNER_TEMP "ProjectX-artifact\ProjectX.zip"
@@ -36,19 +36,35 @@ jobs:
           if (Test-Path $extract) {
             Remove-Item $extract -Recurse -Force
           }
+
           New-Item -ItemType Directory -Path $extract | Out-Null
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          [xml]$config = Get-Content (Join-Path $extract "web.config")
-          $dll = $config.configuration.'system.webServer'.aspNetCore.GetAttribute("arguments")
-
-          if (!$dll -or $dll -notmatch '\.dll') {
-            throw "Could not determine the application DLL from web.config."
+          $webConfig = Join-Path $extract "web.config"
+          if (!(Test-Path $webConfig)) {
+            throw "web.config not found in deployment package."
           }
 
+          Write-Host "----- Published web.config -----"
+          Get-Content $webConfig
+          Write-Host "--------------------------------"
+
+          [xml]$config = Get-Content $webConfig -Raw
+          $aspNetCore = $config.SelectSingleNode(
+            "/*[local-name()='configuration']/*[local-name()='system.webServer']/*[local-name()='aspNetCore']"
+          )
+
+          if ($null -eq $aspNetCore) {
+            throw "No aspNetCore element found in web.config. Inspect the XML printed above."
+          }
+
+          $dll = $aspNetCore.GetAttribute("arguments")
+          Write-Host "aspNetCore arguments: $dll"
+
           $dllName = [regex]::Match($dll, '[^" ]+\.dll').Value
+
           if (!$dllName -or !(Test-Path (Join-Path $extract $dllName))) {
-            throw "Application DLL referenced by web.config was not found."
+            throw "Could not find the application DLL referenced by web.config."
           }
 
           "DEPLOY_SOURCE=$extract" >> $env:GITHUB_ENV
