@@ -31,7 +31,7 @@ jobs:
 
       - name: Locate solution or project
         id: locate
-        shell: pwsh
+        shell: powershell
         run: |
           $solution = Get-ChildItem -Path . -Filter *.sln -Recurse |
             Where-Object { $_.FullName -notmatch '\\(bin|obj)\\' } |
