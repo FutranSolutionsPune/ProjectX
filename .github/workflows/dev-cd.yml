@@ -24,7 +24,7 @@ jobs:
           name: ProjectX-${{ github.sha }}
           path: ${{ runner.temp }}\ProjectX-artifact
 
-            - name: Validate deployment package
+      - name: Validate deployment package
         shell: powershell
         run: |
           $zip = Join-Path $env:RUNNER_TEMP "ProjectX-artifact\ProjectX.zip"
@@ -45,26 +45,29 @@ jobs:
             throw "web.config not found in deployment package."
           }
 
-          Write-Host "----- Published web.config -----"
-          Get-Content $webConfig
-          Write-Host "--------------------------------"
-
           [xml]$config = Get-Content $webConfig -Raw
-          $aspNetCore = $config.SelectSingleNode(
-            "/*[local-name()='configuration']/*[local-name()='system.webServer']/*[local-name()='aspNetCore']"
-          )
+          $aspNetCore = $config.SelectSingleNode("/*[local-name()='configuration']/*[local-name()='system.webServer']/*[local-name()='aspNetCore']")
 
           if ($null -eq $aspNetCore) {
-            throw "No aspNetCore element found in web.config. Inspect the XML printed above."
+            Write-Host "Published web.config:"
+            Get-Content $webConfig
+            throw "No aspNetCore element found in web.config."
           }
 
-          $dll = $aspNetCore.GetAttribute("arguments")
-          Write-Host "aspNetCore arguments: $dll"
+          $arguments = $aspNetCore.GetAttribute("arguments")
+          $processPath = $aspNetCore.GetAttribute("processPath")
 
-          $dllName = [regex]::Match($dll, '[^" ]+\.dll').Value
-
-          if (!$dllName -or !(Test-Path (Join-Path $extract $dllName))) {
-            throw "Could not find the application DLL referenced by web.config."
+          if ($arguments -match '([^" ]+\.dll)') {
+            $dllName = $Matches[1]
+            if (!(Test-Path (Join-Path $extract $dllName))) {
+              throw "Application DLL '$dllName' referenced by web.config was not found."
+            }
+          }
+          elseif ($processPath -match 'dotnet') {
+            throw "web.config uses dotnet hosting but its application DLL could not be identified from arguments."
+          }
+          elseif (!$processPath) {
+            throw "web.config has neither a usable arguments attribute nor processPath."
           }
 
           "DEPLOY_SOURCE=$extract" >> $env:GITHUB_ENV
@@ -83,6 +86,7 @@ jobs:
           if (!(Test-Path "IIS:\Sites\$site")) {
             throw "IIS site '$site' does not exist."
           }
+
           if (!(Test-Path $source)) {
             throw "Deployment source does not exist."
           }
@@ -91,6 +95,7 @@ jobs:
           New-Item -ItemType Directory -Path $backup -Force | Out-Null
 
           $hadPreviousFiles = @(Get-ChildItem $destination -Force).Count -gt 0
+
           if ($hadPreviousFiles) {
             Copy-Item "$destination\*" $backup -Recurse -Force
           }
@@ -107,18 +112,34 @@ jobs:
             Start-WebAppPool -Name $pool
             Start-WebSite -Name $site
 
-            Write-Host "Deployment files copied successfully."
+            $healthy = $false
+            for ($i = 1; $i -le 12; $i++) {
+              try {
+                $response = Invoke-WebRequest -Uri "http://localhost:8085/" -UseBasicParsing -TimeoutSec 10
+                if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                  $healthy = $true
+                  break
+                }
+              }
+              catch {
+                Write-Host "Health check attempt $i failed: $_"
+              }
+              Start-Sleep -Seconds 5
+            }
+
+            if (!$healthy) {
+              throw "DEV health check failed at http://localhost:8085/"
+            }
+
+            Write-Host "DEV deployment and health check succeeded."
           }
           catch {
-            Write-Error "Deployment failed. Attempting rollback: $_"
+            $deploymentError = $_
+            Write-Error "Deployment failed. Attempting rollback: $deploymentError"
 
             try {
-              if ((Get-WebAppPoolState -Name $pool).Value -ne "Stopped") {
-                Stop-WebAppPool -Name $pool
-              }
-              if ((Get-WebSite -Name $site).State -ne "Stopped") {
-                Stop-WebSite -Name $site
-              }
+              Stop-WebSite -Name $site -ErrorAction SilentlyContinue
+              Stop-WebAppPool -Name $pool -ErrorAction SilentlyContinue
 
               Get-ChildItem $destination -Force |
                 Remove-Item -Recurse -Force
@@ -129,42 +150,12 @@ jobs:
 
               Start-WebAppPool -Name $pool
               Start-WebSite -Name $site
-              Write-Host "Rollback file restoration completed."
+
+              Write-Host "Rollback restoration attempted. Verify site health."
             }
             catch {
-              Write-Error "CRITICAL: Automatic rollback failed: $_"
+              Write-Error "CRITICAL: Rollback failed: $_"
             }
 
-            throw "Deployment failed; review logs and verify the IIS site."
+            throw "Deployment failed. Original error: $deploymentError"
           }
-
-      - name: Verify DEV health
-        shell: powershell
-        run: |
-          $url = "http://localhost:8085/"
-          $healthy = $false
-
-          for ($i = 1; $i -le 12; $i++) {
-            try {
-              $response = Invoke-WebRequest `
-                -Uri $url `
-                -UseBasicParsing `
-                -TimeoutSec 10
-
-              if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
-                $healthy = $true
-                break
-              }
-            }
-            catch {
-              Write-Host "Health check attempt $i failed: $_"
-            }
-
-            Start-Sleep -Seconds 5
-          }
-
-          if (!$healthy) {
-            throw "DEV health check failed at $url."
-          }
-
-          Write-Host "DEV health check passed."
