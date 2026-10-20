@@ -2,10 +2,7 @@
 name: ProjectX DEV CD
 
 on:
-  workflow_run:
-    workflows: ["ProjectX CI"]
-    types: [completed]
-    branches: [develop]
+  workflow_call:
 
 permissions:
   actions: read
@@ -17,144 +14,141 @@ concurrency:
 
 jobs:
   deploy:
-    name: Deploy to DEV IIS
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'develop'
-
+    name: Deploy artifact to DEV IIS
     runs-on: [self-hosted, Windows, X64, iis, dev]
 
     steps:
-      - name: Download artifact from triggering CI run
+      - name: Download CI artifact
         uses: actions/download-artifact@v4
         with:
-          name: ProjectX-${{ github.event.workflow_run.head_sha }}
+          name: ProjectX-${{ github.sha }}
           path: ${{ runner.temp }}\ProjectX-artifact
-          repository: ${{ github.repository }}
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate deployment package
-        shell: powershell
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
           $zip = Join-Path $env:RUNNER_TEMP "ProjectX-artifact\ProjectX.zip"
-          $extract = Join-Path $env:RUNNER_TEMP "ProjectX-extracted"
-
-          if (-not (Test-Path $zip)) {
-            throw "ProjectX.zip was not found in the CI artifact."
+          if (!(Test-Path $zip)) {
+            throw "Deployment package not found: $zip"
           }
 
+          $extract = Join-Path $env:RUNNER_TEMP "ProjectX-deploy"
           if (Test-Path $extract) {
             Remove-Item $extract -Recurse -Force
           }
-
           New-Item -ItemType Directory -Path $extract | Out-Null
-          Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          $webConfig = Join-Path $extract "web.config"
-          if (-not (Test-Path $webConfig)) {
-            throw "web.config is missing from the publish root."
+          [xml]$config = Get-Content (Join-Path $extract "web.config")
+          $dll = $config.configuration.'system.webServer'.aspNetCore.GetAttribute("arguments")
+
+          if (!$dll -or $dll -notmatch '\.dll') {
+            throw "Could not determine the application DLL from web.config."
           }
 
-          $config = [xml](Get-Content -LiteralPath $webConfig -Raw)
-          $aspNetCore = $config.SelectSingleNode("//aspNetCore")
-
-          if (-not $aspNetCore) {
-            throw "web.config has no aspNetCore handler configuration."
-          }
-
-          $dllName = [System.IO.Path]::GetFileName($aspNetCore.GetAttribute("processPath"))
-          if ($aspNetCore.GetAttribute("arguments") -match '\.dll') {
-            $match = [regex]::Match($aspNetCore.GetAttribute("arguments"), '[^"]+\.dll')
-            if ($match.Success) {
-              $dllName = [System.IO.Path]::GetFileName($match.Value)
-            }
-          }
-
-          if (-not $dllName -or -not (Test-Path (Join-Path $extract $dllName))) {
+          $dllName = [regex]::Match($dll, '[^" ]+\.dll').Value
+          if (!$dllName -or !(Test-Path (Join-Path $extract $dllName))) {
             throw "Application DLL referenced by web.config was not found."
           }
 
           "DEPLOY_SOURCE=$extract" >> $env:GITHUB_ENV
-          Write-Host "Validated published application: $dllName"
 
-      - name: Deploy to ProjectX DEV IIS
-        shell: powershell
+      - name: Deploy with rollback protection
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          Import-Module WebAdministration
+          Import-Module WebAdministration -ErrorAction Stop
 
-          $siteName = "ProjectX-DEV"
-          $poolName = "ProjectX-DEV"
+          $site = "ProjectX-DEV"
+          $pool = "ProjectX-DEV"
           $destination = "C:\inetpub\wwwroot\ProjectX"
+          $backup = Join-Path $env:RUNNER_TEMP ("ProjectX-backup-" + $env:GITHUB_RUN_ID)
           $source = $env:DEPLOY_SOURCE
 
-          $site = Get-Website -Name $siteName -ErrorAction SilentlyContinue
-          if (-not $site) { throw "IIS site $siteName was not found." }
-
-          if (-not (Test-Path $destination)) {
-            throw "IIS destination does not exist: $destination"
+          if (!(Test-Path "IIS:\Sites\$site")) {
+            throw "IIS site '$site' does not exist."
+          }
+          if (!(Test-Path $source)) {
+            throw "Deployment source does not exist."
           }
 
-          if (-not (Test-Path (Join-Path $source "web.config"))) {
-            throw "Publish output is invalid."
-          }
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          New-Item -ItemType Directory -Path $backup -Force | Out-Null
 
-          $backup = Join-Path $env:RUNNER_TEMP "ProjectX-backup"
-          if (Test-Path $backup) {
-            Remove-Item $backup -Recurse -Force
+          $hadPreviousFiles = @(Get-ChildItem $destination -Force).Count -gt 0
+          if ($hadPreviousFiles) {
+            Copy-Item "$destination\*" $backup -Recurse -Force
           }
-          New-Item -ItemType Directory -Path $backup | Out-Null
-
-          # Preserve the currently deployed files.
-          Copy-Item (Join-Path $destination "*") $backup `
-            -Recurse -Force -ErrorAction SilentlyContinue
 
           try {
-            Stop-Website -Name $siteName
-            Stop-WebAppPool -Name $poolName
+            Stop-WebSite -Name $site
+            Stop-WebAppPool -Name $pool
 
-            Get-ChildItem -LiteralPath $destination -Force |
+            Get-ChildItem $destination -Force |
               Remove-Item -Recurse -Force
 
-            Copy-Item (Join-Path $source "*") $destination -Recurse -Force
+            Copy-Item "$source\*" $destination -Recurse -Force
 
-            Start-WebAppPool -Name $poolName
-            Start-Website -Name $siteName
+            Start-WebAppPool -Name $pool
+            Start-WebSite -Name $site
+
+            Write-Host "Deployment files copied successfully."
           }
           catch {
-            Write-Error "Deployment failed: $($_.Exception.Message)"
-            throw
+            Write-Error "Deployment failed. Attempting rollback: $_"
+
+            try {
+              if ((Get-WebAppPoolState -Name $pool).Value -ne "Stopped") {
+                Stop-WebAppPool -Name $pool
+              }
+              if ((Get-WebSite -Name $site).State -ne "Stopped") {
+                Stop-WebSite -Name $site
+              }
+
+              Get-ChildItem $destination -Force |
+                Remove-Item -Recurse -Force
+
+              if ($hadPreviousFiles) {
+                Copy-Item "$backup\*" $destination -Recurse -Force
+              }
+
+              Start-WebAppPool -Name $pool
+              Start-WebSite -Name $site
+              Write-Host "Rollback file restoration completed."
+            }
+            catch {
+              Write-Error "CRITICAL: Automatic rollback failed: $_"
+            }
+
+            throw "Deployment failed; review logs and verify the IIS site."
           }
 
-      - name: Verify DEV endpoint
-        shell: powershell
+      - name: Verify DEV health
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
           $url = "http://localhost:8085/"
           $healthy = $false
 
-          for ($attempt = 1; $attempt -le 12; $attempt++) {
+          for ($i = 1; $i -le 12; $i++) {
             try {
-              $response = Invoke-WebRequest -Uri $url `
-                -UseBasicParsing -TimeoutSec 10
+              $response = Invoke-WebRequest `
+                -Uri $url `
+                -UseBasicParsing `
+                -TimeoutSec 10
 
               if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
-                Write-Host "DEV health check passed: HTTP $($response.StatusCode)"
                 $healthy = $true
                 break
               }
             }
             catch {
-              Write-Host "Attempt $attempt failed: $($_.Exception.Message)"
+              Write-Host "Health check attempt $i failed: $_"
             }
 
             Start-Sleep -Seconds 5
           }
 
-          if (-not $healthy) {
-            throw "DEV endpoint did not return a healthy HTTP response."
+          if (!$healthy) {
+            throw "DEV health check failed at $url."
           }
+
+          Write-Host "DEV health check passed."
