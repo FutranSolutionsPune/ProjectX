@@ -46,7 +46,7 @@ jobs:
           }
 
           [xml]$config = Get-Content $webConfig -Raw
-          $aspNetCore = $config.SelectSingleNode("/*[local-name()='configuration']/*[local-name()='system.webServer']/*[local-name()='aspNetCore']")
+          $aspNetCore = $config.SelectSingleNode("//*[local-name()='aspNetCore']")
 
           if ($null -eq $aspNetCore) {
             Write-Host "Published web.config:"
