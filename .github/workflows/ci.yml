@@ -56,15 +56,15 @@ jobs:
           "PROJECT_NAME=$([System.IO.Path]::GetFileNameWithoutExtension($projects[0].Name))" >> $env:GITHUB_ENV
 
       - name: Restore
-        shell: pwsh
+        shell: powershell
         run: dotnet restore "$env:PROJECT_PATH"
 
       - name: Build
-        shell: pwsh
+        shell: powershell
         run: dotnet build "$env:PROJECT_PATH" --configuration Release --no-restore
 
       - name: Run tests
-        shell: pwsh
+        shell: powershell
         run: |
           $tests = @(
             Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter *.csproj -Recurse |
@@ -86,7 +86,7 @@ jobs:
           }
 
       - name: Publish application
-        shell: pwsh
+        shell: powershell
         run: |
           $publish = Join-Path $env:RUNNER_TEMP "ProjectX-publish"
           if (Test-Path $publish) {
@@ -109,7 +109,7 @@ jobs:
           "PUBLISH_DIR=$publish" >> $env:GITHUB_ENV
 
       - name: Create deployment package
-        shell: pwsh
+        shell: powershell
         run: |
           $zip = Join-Path $env:RUNNER_TEMP "ProjectX.zip"
           if (Test-Path $zip) {
