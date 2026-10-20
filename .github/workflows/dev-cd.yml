@@ -25,7 +25,7 @@ jobs:
           path: ${{ runner.temp }}\ProjectX-artifact
 
       - name: Validate deployment package
-        shell: pwsh
+        shell: powershell
         run: |
           $zip = Join-Path $env:RUNNER_TEMP "ProjectX-artifact\ProjectX.zip"
           if (!(Test-Path $zip)) {
@@ -54,7 +54,7 @@ jobs:
           "DEPLOY_SOURCE=$extract" >> $env:GITHUB_ENV
 
       - name: Deploy with rollback protection
-        shell: pwsh
+        shell: powershell
         run: |
           Import-Module WebAdministration -ErrorAction Stop
 
@@ -123,7 +123,7 @@ jobs:
           }
 
       - name: Verify DEV health
-        shell: pwsh
+        shell: powershell
         run: |
           $url = "http://localhost:8085/"
           $healthy = $false
