@@ -72,6 +72,7 @@ jobs:
 
           "DEPLOY_SOURCE=$extract" >> $env:GITHUB_ENV
 
+      
       - name: Deploy with rollback protection
         shell: powershell
         run: |
@@ -103,6 +104,23 @@ jobs:
           try {
             Stop-WebSite -Name $site
             Stop-WebAppPool -Name $pool
+
+            $poolStopped = $false
+            for ($i = 1; $i -le 30; $i++) {
+              $poolState = (Get-WebAppPoolState -Name $pool).Value
+              if ($poolState -eq "Stopped") {
+                $poolStopped = $true
+                break
+              }
+
+              Start-Sleep -Seconds 2
+            }
+
+            if (!$poolStopped) {
+              throw "Application pool '$pool' did not reach Stopped state within 60 seconds."
+            }
+
+            Start-Sleep -Seconds 2
 
             Get-ChildItem $destination -Force |
               Remove-Item -Recurse -Force
@@ -140,6 +158,23 @@ jobs:
             try {
               Stop-WebSite -Name $site -ErrorAction SilentlyContinue
               Stop-WebAppPool -Name $pool -ErrorAction SilentlyContinue
+
+              $rollbackPoolStopped = $false
+              for ($i = 1; $i -le 30; $i++) {
+                $rollbackPoolState = (Get-WebAppPoolState -Name $pool).Value
+                if ($rollbackPoolState -eq "Stopped") {
+                  $rollbackPoolStopped = $true
+                  break
+                }
+
+                Start-Sleep -Seconds 2
+              }
+
+              if (!$rollbackPoolStopped) {
+                throw "Application pool '$pool' did not stop for rollback."
+              }
+
+              Start-Sleep -Seconds 2
 
               Get-ChildItem $destination -Force |
                 Remove-Item -Recurse -Force
