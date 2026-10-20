@@ -111,8 +111,15 @@ jobs:
           }
 
           try {
-            Stop-WebSite -Name $site -ErrorAction Stop
-            Stop-WebAppPool -Name $pool -ErrorAction Stop
+            $siteState = (Get-WebSite -Name $site).State
+            if ($siteState -ne "Stopped") {
+              Stop-WebSite -Name $site
+            }
+
+            $poolState = (Get-WebAppPoolState -Name $pool).Value
+            if ($poolState -ne "Stopped") {
+              Stop-WebAppPool -Name $pool
+            }
 
             # Wait until IIS confirms the application pool has stopped.
             $poolStopped = $false
@@ -174,8 +181,15 @@ jobs:
             Write-Error "Deployment failed. Attempting rollback: $deploymentError"
 
             try {
-              Stop-WebSite -Name $site -ErrorAction SilentlyContinue
-              Stop-WebAppPool -Name $pool -ErrorAction SilentlyContinue
+              $siteState = (Get-WebSite -Name $site).State
+              if ($siteState -ne "Stopped") {
+                Stop-WebSite -Name $site -ErrorAction SilentlyContinue
+              }
+
+              $poolState = (Get-WebAppPoolState -Name $pool).Value
+              if ($poolState -ne "Stopped") {
+                Stop-WebAppPool -Name $pool -ErrorAction SilentlyContinue
+              }
 
               $rollbackPoolStopped = $false
               for ($i = 1; $i -le 30; $i++) {
