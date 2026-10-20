@@ -3,13 +3,9 @@ name: ProjectX CI
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
   pull_request:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
@@ -29,235 +25,79 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: Locate solution and web projects
-        id: locate
+      - name: Locate project
+        id: project
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          $projects = @(Get-ChildItem $env:GITHUB_WORKSPACE -Filter "*.csproj" -Recurse -File |
+            Where-Object { $_.FullName -notmatch '[\\/](bin|obj)[\\/]' })
 
-          $solutions = @(
-            Get-ChildItem -Path $env:GITHUB_WORKSPACE `
-              -Filter "*.sln" -Recurse -File |
-              Where-Object {
-                $_.FullName -notmatch '[\\/](bin|obj)[\\/]'
-              }
-          )
-
-          $projects = @(
-            Get-ChildItem -Path $env:GITHUB_WORKSPACE `
-              -Filter "*.csproj" -Recurse -File |
-              Where-Object {
-                $_.FullName -notmatch '[\\/](bin|obj)[\\/]'
-              }
-          )
-
-          Write-Host "Repository workspace: $env:GITHUB_WORKSPACE"
-          Write-Host "Solution files found: $($solutions.Count)"
-          Write-Host "Project files found: $($projects.Count)"
-
-          $solutions | ForEach-Object {
-            Write-Host "Solution: $($_.FullName)"
+          if ($projects.Count -ne 1) {
+            throw "Expected exactly one .csproj for this POC; found $($projects.Count)."
           }
 
-          $projects | ForEach-Object {
-            Write-Host "Project: $($_.FullName)"
-          }
+          "PROJECT_PATH=$($projects[0].FullName)" >> $env:GITHUB_ENV
+          "PROJECT_NAME=$([IO.Path]::GetFileNameWithoutExtension($projects[0].Name))" >> $env:GITHUB_ENV
 
-          if ($projects.Count -eq 0) {
-            Get-ChildItem -Path $env:GITHUB_WORKSPACE -Force |
-              Select-Object Mode, Name |
-              Format-Table -AutoSize
-
-            throw "No .csproj files found in the checked-out repository. Check that the application source is committed to the branch being built."
-          }
-
-          $webProjects = @()
-
-          foreach ($project in $projects) {
-            [xml]$xml = Get-Content -LiteralPath $project.FullName -Raw
-
-            $webSdk = $false
-
-            foreach ($sdk in $xml.SelectNodes("//*[local-name()='Project']/@Sdk")) {
-              if ($sdk.Value -eq "Microsoft.NET.Sdk.Web") {
-                $webSdk = $true
-              }
-            }
-
-            foreach ($sdk in $xml.SelectNodes("//*[local-name()='Sdk']/@Name")) {
-              if ($sdk.Value -eq "Microsoft.NET.Sdk.Web") {
-                $webSdk = $true
-              }
-            }
-
-            if ($webSdk) {
-              $webProjects += $project
-            }
-          }
-
-          if ($webProjects.Count -eq 0) {
-            throw "No ASP.NET Core web projects using Microsoft.NET.Sdk.Web were found."
-          }
-
-          Write-Host "ASP.NET Core web projects found: $($webProjects.Count)"
-
-          foreach ($project in $webProjects) {
-            Write-Host "Web project: $($project.FullName)"
-          }
-
-          "solution_count=$($solutions.Count)" >> $env:GITHUB_OUTPUT
-          "web_count=$($webProjects.Count)" >> $env:GITHUB_OUTPUT
-
-          $solutionPath = ""
-          if ($solutions.Count -gt 0) {
-            $solutionPath = $solutions[0].FullName
-          }
-
-          "solution_path=$solutionPath" >> $env:GITHUB_OUTPUT
-
-          $webProjects |
-            ForEach-Object { $_.FullName } |
-            Set-Content -LiteralPath "$env:RUNNER_TEMP\web-projects.txt"
-
-      - name: Restore dependencies
+      - name: Restore
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-          $solution = "${{ steps.locate.outputs.solution_path }}"
+          dotnet restore "$env:PROJECT_PATH"
+          if ($LASTEXITCODE -ne 0) { throw "Restore failed." }
 
-          if ($solution) {
-            dotnet restore "$solution"
-            if ($LASTEXITCODE -ne 0) {
-              throw "Solution restore failed."
-            }
-          } else {
-            Get-Content "$env:RUNNER_TEMP\web-projects.txt" |
-              ForEach-Object {
-                dotnet restore "$_"
-                if ($LASTEXITCODE -ne 0) {
-                  throw "Restore failed for $_"
-                }
-              }
-          }
-
-      - name: Build application
+      - name: Build
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-          $solution = "${{ steps.locate.outputs.solution_path }}"
+          dotnet build "$env:PROJECT_PATH" --configuration Release --no-restore
+          if ($LASTEXITCODE -ne 0) { throw "Build failed." }
 
-          if ($solution) {
-            dotnet build "$solution" --configuration Release --no-restore
-            if ($LASTEXITCODE -ne 0) {
-              throw "Solution build failed."
-            }
-          } else {
-            Get-Content "$env:RUNNER_TEMP\web-projects.txt" |
-              ForEach-Object {
-                dotnet build "$_" --configuration Release --no-restore
-                if ($LASTEXITCODE -ne 0) {
-                  throw "Build failed for $_"
-                }
-              }
-          }
-
-      - name: Run automated tests
+      - name: Run tests if present
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $tests = @(
-            Get-ChildItem -Path $env:GITHUB_WORKSPACE `
-              -Filter "*Tests.csproj" -Recurse -File |
-              Where-Object {
-                $_.FullName -notmatch '[\\/](bin|obj)[\\/]'
-              }
-          )
-
-          $tests += @(
-            Get-ChildItem -Path $env:GITHUB_WORKSPACE `
-              -Filter "*Test.csproj" -Recurse -File |
-              Where-Object {
-                $_.FullName -notmatch '[\\/](bin|obj)[\\/]'
-              }
-          )
-
+          $tests = @(Get-ChildItem $env:GITHUB_WORKSPACE -Filter "*Tests.csproj" -Recurse -File |
+            Where-Object { $_.FullName -notmatch '[\\/](bin|obj)[\\/]' })
+          $tests += @(Get-ChildItem $env:GITHUB_WORKSPACE -Filter "*Test.csproj" -Recurse -File |
+            Where-Object { $_.FullName -notmatch '[\\/](bin|obj)[\\/]' })
           $tests = @($tests | Sort-Object FullName -Unique)
 
-          if ($tests.Count -eq 0) {
-            Write-Host "No matching test projects found. Skipping tests."
-          } else {
-            foreach ($test in $tests) {
-              Write-Host "Testing $($test.FullName)"
-              dotnet test "$($test.FullName)" `
-                --configuration Release
-
-              if ($LASTEXITCODE -ne 0) {
-                throw "Tests failed: $($test.FullName)"
-              }
-            }
+          foreach ($test in $tests) {
+            dotnet test "$($test.FullName)" --configuration Release
+            if ($LASTEXITCODE -ne 0) { throw "Tests failed: $($test.FullName)" }
           }
 
-      - name: Publish web applications
+          if ($tests.Count -eq 0) { Write-Host "No test projects found; skipping tests." }
+
+      - name: Publish application
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $publish = Join-Path $env:RUNNER_TEMP "ProjectX-publish"
+          if (Test-Path $publish) { Remove-Item $publish -Recurse -Force }
 
-          $publishRoot = Join-Path $env:RUNNER_TEMP "ProjectX-publish"
+          dotnet publish "$env:PROJECT_PATH" `
+            --configuration Release `
+            --no-build `
+            --output "$publish"
 
-          if (Test-Path $publishRoot) {
-            Remove-Item $publishRoot -Recurse -Force
+          if ($LASTEXITCODE -ne 0) { throw "Publish failed." }
+
+          if (-not (Test-Path (Join-Path $publish "web.config"))) {
+            throw "Published web.config missing. Check ASP.NET Core Web SDK and publish output."
           }
 
-          New-Item -ItemType Directory -Path $publishRoot -Force |
-            Out-Null
-
-          $projects = Get-Content "$env:RUNNER_TEMP\web-projects.txt"
-          $index = 0
-
-          foreach ($project in $projects) {
-            $index++
-            $projectName = [System.IO.Path]::GetFileNameWithoutExtension($project)
-            $destination = Join-Path $publishRoot $projectName
-
-            Write-Host "Publishing $project to $destination"
-
-            dotnet publish "$project" `
-              --configuration Release `
-              --no-build `
-              --output "$destination"
-
-            if ($LASTEXITCODE -ne 0) {
-              throw "Publish failed for $project"
-            }
-          }
-
-          if (-not (Get-ChildItem $publishRoot -Recurse -File)) {
-            throw "Publish output is empty."
+          if (-not (Test-Path (Join-Path $publish "$env:PROJECT_NAME.dll"))) {
+            throw "Published application DLL missing."
           }
 
       - name: Create deployment ZIP
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $publish = Join-Path $env:RUNNER_TEMP "ProjectX-publish"
+          $zip = Join-Path $env:RUNNER_TEMP "ProjectX.zip"
 
-          $publishRoot = Join-Path $env:RUNNER_TEMP "ProjectX-publish"
-          $zipPath = Join-Path $env:RUNNER_TEMP "ProjectX.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
 
-          if (Test-Path $zipPath) {
-            Remove-Item $zipPath -Force
-          }
-
-          Compress-Archive `
-            -Path "$publishRoot\*" `
-            -DestinationPath $zipPath `
-            -Force
-
-          if (-not (Test-Path $zipPath)) {
-            throw "ProjectX.zip was not created."
-          }
-
-          Write-Host "Created artifact: $zipPath"
+          Compress-Archive -Path "$publish\*" -DestinationPath $zip -Force
 
       - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
