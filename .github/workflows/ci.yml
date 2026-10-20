@@ -3,13 +3,25 @@ name: ProjectX CI
 
 on:
   push:
-    branches: [main, develop]
+    branches:
+      - develop
+      - main
+      - "feature/**"
+      - "epic/**"
+      - "release/**"
+      - "hotfix/**"
   pull_request:
-    branches: [main, develop]
+    branches:
+      - develop
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -20,89 +32,110 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Setup .NET 8
+      - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: "8.0.x"
 
-      - name: Locate project
-        id: project
-        shell: powershell
+      - name: Locate application project
+        shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $projects = @(Get-ChildItem $env:GITHUB_WORKSPACE -Filter "*.csproj" -Recurse -File |
-            Where-Object { $_.FullName -notmatch '[\\/](bin|obj)[\\/]' })
+          $projects = @(
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter *.csproj -Recurse |
+              Where-Object {
+                $_.FullName -notmatch '[\\/](bin|obj)[\\/]' -and
+                $_.Name -notmatch 'Tests?\.csproj$'
+              }
+          )
 
           if ($projects.Count -ne 1) {
-            throw "Expected exactly one .csproj for this POC; found $($projects.Count)."
+            throw "Expected exactly one application .csproj; found $($projects.Count)."
           }
 
           "PROJECT_PATH=$($projects[0].FullName)" >> $env:GITHUB_ENV
-          "PROJECT_NAME=$([IO.Path]::GetFileNameWithoutExtension($projects[0].Name))" >> $env:GITHUB_ENV
+          "PROJECT_NAME=$([System.IO.Path]::GetFileNameWithoutExtension($projects[0].Name))" >> $env:GITHUB_ENV
 
       - name: Restore
-        shell: powershell
-        run: |
-          dotnet restore "$env:PROJECT_PATH"
-          if ($LASTEXITCODE -ne 0) { throw "Restore failed." }
+        shell: pwsh
+        run: dotnet restore "$env:PROJECT_PATH"
 
       - name: Build
-        shell: powershell
-        run: |
-          dotnet build "$env:PROJECT_PATH" --configuration Release --no-restore
-          if ($LASTEXITCODE -ne 0) { throw "Build failed." }
+        shell: pwsh
+        run: dotnet build "$env:PROJECT_PATH" --configuration Release --no-restore
 
-      - name: Run tests if present
-        shell: powershell
+      - name: Run tests
+        shell: pwsh
         run: |
-          $tests = @(Get-ChildItem $env:GITHUB_WORKSPACE -Filter "*Tests.csproj" -Recurse -File |
-            Where-Object { $_.FullName -notmatch '[\\/](bin|obj)[\\/]' })
-          $tests += @(Get-ChildItem $env:GITHUB_WORKSPACE -Filter "*Test.csproj" -Recurse -File |
-            Where-Object { $_.FullName -notmatch '[\\/](bin|obj)[\\/]' })
-          $tests = @($tests | Sort-Object FullName -Unique)
+          $tests = @(
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter *.csproj -Recurse |
+              Where-Object {
+                $_.FullName -notmatch '[\\/](bin|obj)[\\/]' -and
+                $_.Name -match 'Tests?\.csproj$'
+              }
+          )
 
-          foreach ($test in $tests) {
-            dotnet test "$($test.FullName)" --configuration Release
-            if ($LASTEXITCODE -ne 0) { throw "Tests failed: $($test.FullName)" }
+          if ($tests.Count -eq 0) {
+            Write-Host "No test project found. Test execution skipped."
+          } else {
+            foreach ($test in $tests) {
+              dotnet test "$($test.FullName)" --configuration Release
+              if ($LASTEXITCODE -ne 0) {
+                throw "Tests failed: $($test.Name)"
+              }
+            }
           }
 
-          if ($tests.Count -eq 0) { Write-Host "No test projects found; skipping tests." }
-
       - name: Publish application
-        shell: powershell
+        shell: pwsh
         run: |
           $publish = Join-Path $env:RUNNER_TEMP "ProjectX-publish"
-          if (Test-Path $publish) { Remove-Item $publish -Recurse -Force }
+          if (Test-Path $publish) {
+            Remove-Item $publish -Recurse -Force
+          }
 
           dotnet publish "$env:PROJECT_PATH" `
             --configuration Release `
             --no-build `
-            --output "$publish"
+            --output $publish
 
-          if ($LASTEXITCODE -ne 0) { throw "Publish failed." }
-
-          if (-not (Test-Path (Join-Path $publish "web.config"))) {
-            throw "Published web.config missing. Check ASP.NET Core Web SDK and publish output."
+          if (!(Test-Path (Join-Path $publish "web.config"))) {
+            throw "Publish output is missing web.config."
           }
 
-          if (-not (Test-Path (Join-Path $publish "$env:PROJECT_NAME.dll"))) {
-            throw "Published application DLL missing."
+          if (!(Test-Path (Join-Path $publish "$env:PROJECT_NAME.dll"))) {
+            throw "Publish output is missing $env:PROJECT_NAME.dll."
           }
 
-      - name: Create deployment ZIP
-        shell: powershell
+          "PUBLISH_DIR=$publish" >> $env:GITHUB_ENV
+
+      - name: Create deployment package
+        shell: pwsh
         run: |
-          $publish = Join-Path $env:RUNNER_TEMP "ProjectX-publish"
           $zip = Join-Path $env:RUNNER_TEMP "ProjectX.zip"
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
 
-          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive `
+            -Path "$env:PUBLISH_DIR\*" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
 
-          Compress-Archive -Path "$publish\*" -DestinationPath $zip -Force
-
-      - name: Upload deployment artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ProjectX-${{ github.sha }}
           path: ${{ runner.temp }}\ProjectX.zip
           if-no-files-found: error
           retention-days: 14
+
+  deploy-dev:
+    name: Deploy to DEV
+    needs: build
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop'
+    uses: ./.github/workflows/cd-dev.yml
+    permissions:
+      actions: read
+      contents: read
