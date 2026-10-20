@@ -18,7 +18,7 @@ permissions:
 jobs:
   build:
     name: Build and Test
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64, iis, dev]
 
     steps:
       - name: Checkout source
