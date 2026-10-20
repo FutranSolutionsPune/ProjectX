@@ -139,3 +139,9 @@ jobs:
     permissions:
       actions: read
       contents: read
+
+  deploy-qa2:
+    name: Deploy epic to QA2
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/epic/')
+    uses: ./.github/workflows/qa2-cd.yml
