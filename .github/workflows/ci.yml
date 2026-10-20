@@ -135,7 +135,7 @@ jobs:
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/develop'
-    uses: ./.github/workflows/cd-dev.yml
+    uses: ./.github/workflows/dev-cd.yml
     permissions:
       actions: read
       contents: read
