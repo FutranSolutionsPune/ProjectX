@@ -46,24 +46,30 @@ jobs:
           }
 
           [xml]$config = Get-Content $webConfig -Raw
-          $aspNetCore = $config.SelectSingleNode("//*[local-name()='aspNetCore']")
+
+          # Match the actual published structure, including the location element.
+          $aspNetCore = $config.SelectSingleNode(
+            "/*[local-name()='configuration']/*[local-name()='location']/*[local-name()='system.webServer']/*[local-name()='aspNetCore']"
+          )
 
           if ($null -eq $aspNetCore) {
             Write-Host "Published web.config:"
             Get-Content $webConfig
-            throw "No aspNetCore element found in web.config."
+            throw "No aspNetCore element found at the expected location in web.config."
           }
 
           $arguments = $aspNetCore.GetAttribute("arguments")
           $processPath = $aspNetCore.GetAttribute("processPath")
 
-          if ($arguments -match '([^" ]+\.dll)') {
-            $dllName = $Matches[1]
-            if (!(Test-Path (Join-Path $extract $dllName))) {
+          if ($arguments -match '(?i)([^" ]+\.dll)') {
+            $dllName = $Matches[1] -replace '^[.][\\/]', ''
+            $dllPath = Join-Path $extract $dllName
+
+            if (!(Test-Path $dllPath)) {
               throw "Application DLL '$dllName' referenced by web.config was not found."
             }
           }
-          elseif ($processPath -match 'dotnet') {
+          elseif ($processPath -match '(?i)dotnet') {
             throw "web.config uses dotnet hosting but its application DLL could not be identified from arguments."
           }
           elseif (!$processPath) {
@@ -72,7 +78,6 @@ jobs:
 
           "DEPLOY_SOURCE=$extract" >> $env:GITHUB_ENV
 
-      
       - name: Deploy with rollback protection
         shell: powershell
         run: |
@@ -88,8 +93,12 @@ jobs:
             throw "IIS site '$site' does not exist."
           }
 
+          if (!(Test-Path "IIS:\AppPools\$pool")) {
+            throw "IIS application pool '$pool' does not exist."
+          }
+
           if (!(Test-Path $source)) {
-            throw "Deployment source does not exist."
+            throw "Deployment source does not exist: $source"
           }
 
           New-Item -ItemType Directory -Path $destination -Force | Out-Null
@@ -102,13 +111,16 @@ jobs:
           }
 
           try {
-            Stop-WebSite -Name $site
-            Stop-WebAppPool -Name $pool
+            Stop-WebSite -Name $site -ErrorAction Stop
+            Stop-WebAppPool -Name $pool -ErrorAction Stop
 
+            # Wait until IIS confirms the application pool has stopped.
             $poolStopped = $false
             for ($i = 1; $i -le 30; $i++) {
-              $poolState = (Get-WebAppPoolState -Name $pool).Value
-              if ($poolState -eq "Stopped") {
+              $state = (Get-WebAppPoolState -Name $pool).Value
+              Write-Host "Application pool state: $state"
+
+              if ($state -eq "Stopped") {
                 $poolStopped = $true
                 break
               }
@@ -117,23 +129,28 @@ jobs:
             }
 
             if (!$poolStopped) {
-              throw "Application pool '$pool' did not reach Stopped state within 60 seconds."
+              throw "Application pool '$pool' did not stop within 60 seconds."
             }
 
-            Start-Sleep -Seconds 2
+            # Allow the worker process to release application file handles.
+            Start-Sleep -Seconds 3
 
             Get-ChildItem $destination -Force |
-              Remove-Item -Recurse -Force
+              Remove-Item -Recurse -Force -ErrorAction Stop
 
-            Copy-Item "$source\*" $destination -Recurse -Force
+            Copy-Item "$source\*" $destination -Recurse -Force -ErrorAction Stop
 
-            Start-WebAppPool -Name $pool
-            Start-WebSite -Name $site
+            Start-WebAppPool -Name $pool -ErrorAction Stop
+            Start-WebSite -Name $site -ErrorAction Stop
 
             $healthy = $false
             for ($i = 1; $i -le 12; $i++) {
               try {
-                $response = Invoke-WebRequest -Uri "http://localhost:8085/" -UseBasicParsing -TimeoutSec 10
+                $response = Invoke-WebRequest `
+                  -Uri "http://localhost:8085/" `
+                  -UseBasicParsing `
+                  -TimeoutSec 10
+
                 if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
                   $healthy = $true
                   break
@@ -142,6 +159,7 @@ jobs:
               catch {
                 Write-Host "Health check attempt $i failed: $_"
               }
+
               Start-Sleep -Seconds 5
             }
 
@@ -161,8 +179,10 @@ jobs:
 
               $rollbackPoolStopped = $false
               for ($i = 1; $i -le 30; $i++) {
-                $rollbackPoolState = (Get-WebAppPoolState -Name $pool).Value
-                if ($rollbackPoolState -eq "Stopped") {
+                $state = (Get-WebAppPoolState -Name $pool).Value
+                Write-Host "Rollback application pool state: $state"
+
+                if ($state -eq "Stopped") {
                   $rollbackPoolStopped = $true
                   break
                 }
@@ -174,19 +194,19 @@ jobs:
                 throw "Application pool '$pool' did not stop for rollback."
               }
 
-              Start-Sleep -Seconds 2
+              Start-Sleep -Seconds 3
 
               Get-ChildItem $destination -Force |
-                Remove-Item -Recurse -Force
+                Remove-Item -Recurse -Force -ErrorAction Stop
 
               if ($hadPreviousFiles) {
-                Copy-Item "$backup\*" $destination -Recurse -Force
+                Copy-Item "$backup\*" $destination -Recurse -Force -ErrorAction Stop
               }
 
-              Start-WebAppPool -Name $pool
-              Start-WebSite -Name $site
+              Start-WebAppPool -Name $pool -ErrorAction Stop
+              Start-WebSite -Name $site -ErrorAction Stop
 
-              Write-Host "Rollback restoration attempted. Verify site health."
+              Write-Host "Rollback file restoration completed. Verify application health."
             }
             catch {
               Write-Error "CRITICAL: Rollback failed: $_"
