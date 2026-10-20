@@ -2,62 +2,40 @@
 name: ProjectX DEV CD
 
 on:
-  workflow_dispatch:
-    inputs:
-      ci_run_id:
-        description: "Successful CI run ID"
-        required: true
-        type: string
+  workflow_run:
+    workflows: ["ProjectX CI"]
+    types: [completed]
+    branches: [develop]
 
 permissions:
   actions: read
   contents: read
 
+concurrency:
+  group: projectx-dev-deployment
+  cancel-in-progress: false
+
 jobs:
   deploy:
     name: Deploy to DEV IIS
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'develop'
+
     runs-on: [self-hosted, Windows, X64, iis, dev]
 
     steps:
-      - name: Validate CI run
-        id: validate
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const runId = Number("${{ inputs.ci_run_id }}");
-            if (!Number.isSafeInteger(runId) || runId <= 0) {
-              core.setFailed("Enter a valid CI run ID.");
-              return;
-            }
-
-            const { data: run } = await github.rest.actions.getWorkflowRun({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: runId
-            });
-
-            if (run.name !== "ProjectX CI" ||
-                run.status !== "completed" ||
-                run.conclusion !== "success" ||
-                run.head_branch !== "develop" ||
-                run.event !== "push") {
-              core.setFailed("Run must be a successful ProjectX CI push on develop.");
-              return;
-            }
-
-            core.setOutput("sha", run.head_sha);
-            core.info(`Validated CI run ${runId}, commit ${run.head_sha}`);
-
-      - name: Download artifact from that CI run
+      - name: Download artifact from triggering CI run
         uses: actions/download-artifact@v4
         with:
-          name: ProjectX-${{ steps.validate.outputs.sha }}
+          name: ProjectX-${{ github.event.workflow_run.head_sha }}
           path: ${{ runner.temp }}\ProjectX-artifact
           repository: ${{ github.repository }}
-          run-id: ${{ inputs.ci_run_id }}
+          run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Validate package
+      - name: Validate deployment package
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -66,7 +44,7 @@ jobs:
           $extract = Join-Path $env:RUNNER_TEMP "ProjectX-extracted"
 
           if (-not (Test-Path $zip)) {
-            throw "ProjectX.zip is missing from the CI artifact."
+            throw "ProjectX.zip was not found in the CI artifact."
           }
 
           if (Test-Path $extract) {
@@ -76,20 +54,32 @@ jobs:
           New-Item -ItemType Directory -Path $extract | Out-Null
           Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
 
-          $webConfig = Get-ChildItem $extract -Filter web.config -Recurse -File |
-            Select-Object -First 1
-
-          if (-not $webConfig) {
-            throw "Published web.config was not found."
+          $webConfig = Join-Path $extract "web.config"
+          if (-not (Test-Path $webConfig)) {
+            throw "web.config is missing from the publish root."
           }
 
-          $source = $webConfig.Directory.FullName
+          $config = [xml](Get-Content -LiteralPath $webConfig -Raw)
+          $aspNetCore = $config.SelectSingleNode("//aspNetCore")
 
-          if (-not (Test-Path (Join-Path $source "ProjectX.dll"))) {
-            throw "ProjectX.dll was not found in the publish directory."
+          if (-not $aspNetCore) {
+            throw "web.config has no aspNetCore handler configuration."
           }
 
-          "DEPLOY_SOURCE=$source" >> $env:GITHUB_ENV
+          $dllName = [System.IO.Path]::GetFileName($aspNetCore.GetAttribute("processPath"))
+          if ($aspNetCore.GetAttribute("arguments") -match '\.dll') {
+            $match = [regex]::Match($aspNetCore.GetAttribute("arguments"), '[^"]+\.dll')
+            if ($match.Success) {
+              $dllName = [System.IO.Path]::GetFileName($match.Value)
+            }
+          }
+
+          if (-not $dllName -or -not (Test-Path (Join-Path $extract $dllName))) {
+            throw "Application DLL referenced by web.config was not found."
+          }
+
+          "DEPLOY_SOURCE=$extract" >> $env:GITHUB_ENV
+          Write-Host "Validated published application: $dllName"
 
       - name: Deploy to ProjectX DEV IIS
         shell: powershell
@@ -102,11 +92,14 @@ jobs:
           $destination = "C:\inetpub\wwwroot\ProjectX"
           $source = $env:DEPLOY_SOURCE
 
-          if (-not (Get-Website -Name $siteName -ErrorAction SilentlyContinue)) {
-            throw "IIS site $siteName was not found."
+          $site = Get-Website -Name $siteName -ErrorAction SilentlyContinue
+          if (-not $site) { throw "IIS site $siteName was not found." }
+
+          if (-not (Test-Path $destination)) {
+            throw "IIS destination does not exist: $destination"
           }
 
-          if (-not (Test-Path (Join-Path $source "ProjectX.dll"))) {
+          if (-not (Test-Path (Join-Path $source "web.config"))) {
             throw "Publish output is invalid."
           }
 
@@ -116,7 +109,7 @@ jobs:
           }
           New-Item -ItemType Directory -Path $backup | Out-Null
 
-          # Preserve the current files for recovery.
+          # Preserve the currently deployed files.
           Copy-Item (Join-Path $destination "*") $backup `
             -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -137,14 +130,14 @@ jobs:
             throw
           }
 
-      - name: Verify DEV site
+      - name: Verify DEV endpoint
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $url = "http://localhost:8085/"
           $healthy = $false
 
-          for ($i = 1; $i -le 12; $i++) {
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
             try {
               $response = Invoke-WebRequest -Uri $url `
                 -UseBasicParsing -TimeoutSec 10
@@ -156,12 +149,12 @@ jobs:
               }
             }
             catch {
-              Write-Host "Attempt $i failed: $($_.Exception.Message)"
+              Write-Host "Attempt $attempt failed: $($_.Exception.Message)"
             }
 
             Start-Sleep -Seconds 5
           }
 
           if (-not $healthy) {
-            throw "DEV health check failed: $url"
+            throw "DEV endpoint did not return a healthy HTTP response."
           }
