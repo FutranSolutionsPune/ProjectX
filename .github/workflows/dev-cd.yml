@@ -1,0 +1,167 @@
+
+name: ProjectX DEV CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: "Successful CI run ID"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to DEV IIS
+    runs-on: [self-hosted, Windows, X64, iis, dev]
+
+    steps:
+      - name: Validate CI run
+        id: validate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = Number("${{ inputs.ci_run_id }}");
+            if (!Number.isSafeInteger(runId) || runId <= 0) {
+              core.setFailed("Enter a valid CI run ID.");
+              return;
+            }
+
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId
+            });
+
+            if (run.name !== "ProjectX CI" ||
+                run.status !== "completed" ||
+                run.conclusion !== "success" ||
+                run.head_branch !== "develop" ||
+                run.event !== "push") {
+              core.setFailed("Run must be a successful ProjectX CI push on develop.");
+              return;
+            }
+
+            core.setOutput("sha", run.head_sha);
+            core.info(`Validated CI run ${runId}, commit ${run.head_sha}`);
+
+      - name: Download artifact from that CI run
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-${{ steps.validate.outputs.sha }}
+          path: ${{ runner.temp }}\ProjectX-artifact
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.ci_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $zip = Join-Path $env:RUNNER_TEMP "ProjectX-artifact\ProjectX.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "ProjectX-extracted"
+
+          if (-not (Test-Path $zip)) {
+            throw "ProjectX.zip is missing from the CI artifact."
+          }
+
+          if (Test-Path $extract) {
+            Remove-Item $extract -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $extract | Out-Null
+          Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+
+          $webConfig = Get-ChildItem $extract -Filter web.config -Recurse -File |
+            Select-Object -First 1
+
+          if (-not $webConfig) {
+            throw "Published web.config was not found."
+          }
+
+          $source = $webConfig.Directory.FullName
+
+          if (-not (Test-Path (Join-Path $source "ProjectX.dll"))) {
+            throw "ProjectX.dll was not found in the publish directory."
+          }
+
+          "DEPLOY_SOURCE=$source" >> $env:GITHUB_ENV
+
+      - name: Deploy to ProjectX DEV IIS
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          $siteName = "ProjectX-DEV"
+          $poolName = "ProjectX-DEV"
+          $destination = "C:\inetpub\wwwroot\ProjectX"
+          $source = $env:DEPLOY_SOURCE
+
+          if (-not (Get-Website -Name $siteName -ErrorAction SilentlyContinue)) {
+            throw "IIS site $siteName was not found."
+          }
+
+          if (-not (Test-Path (Join-Path $source "ProjectX.dll"))) {
+            throw "Publish output is invalid."
+          }
+
+          $backup = Join-Path $env:RUNNER_TEMP "ProjectX-backup"
+          if (Test-Path $backup) {
+            Remove-Item $backup -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $backup | Out-Null
+
+          # Preserve the current files for recovery.
+          Copy-Item (Join-Path $destination "*") $backup `
+            -Recurse -Force -ErrorAction SilentlyContinue
+
+          try {
+            Stop-Website -Name $siteName
+            Stop-WebAppPool -Name $poolName
+
+            Get-ChildItem -LiteralPath $destination -Force |
+              Remove-Item -Recurse -Force
+
+            Copy-Item (Join-Path $source "*") $destination -Recurse -Force
+
+            Start-WebAppPool -Name $poolName
+            Start-Website -Name $siteName
+          }
+          catch {
+            Write-Error "Deployment failed: $($_.Exception.Message)"
+            throw
+          }
+
+      - name: Verify DEV site
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "http://localhost:8085/"
+          $healthy = $false
+
+          for ($i = 1; $i -le 12; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri $url `
+                -UseBasicParsing -TimeoutSec 10
+
+              if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                Write-Host "DEV health check passed: HTTP $($response.StatusCode)"
+                $healthy = $true
+                break
+              }
+            }
+            catch {
+              Write-Host "Attempt $i failed: $($_.Exception.Message)"
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $healthy) {
+            throw "DEV health check failed: $url"
+          }
