@@ -1,3 +1,4 @@
+
 name: ProjectX CD — Production Deployment
 
 on:
@@ -63,7 +64,6 @@ jobs:
           Write-Host "Source commit: $env:SOURCE_SHA"
           Write-Host "Original CI run: $env:CI_RUN_ID"
 
-
       - name: Download Staging success record
         uses: actions/download-artifact@v4
         with:
@@ -115,62 +115,6 @@ jobs:
           Write-Host "Staging verification passed."
           Write-Host "Verified branch: $($record.source_ref)"
           Write-Host "Verified commit: $($record.source_sha)"
-
-
-      - name: Download Staging success record
-        uses: actions/download-artifact@v4
-        with:
-          name: ProjectX-Staging-Passed-${{ inputs.source_sha }}
-          path: ${{ runner.temp }}\ProjectX-Staging-Record
-          run-id: ${{ inputs.ci_run_id }}
-          repository: ${{ github.repository }}
-          github-token: ${{ github.token }}
-
-      - name: Verify Staging record
-        shell: powershell
-        env:
-          CI_RUN_ID: ${{ inputs.ci_run_id }}
-          RELEASE_BRANCH: ${{ inputs.release_branch }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $recordPath = Join-Path `
-            $env:RUNNER_TEMP `
-            "ProjectX-Staging-Record\staging-passed.json"
-
-          if (!(Test-Path $recordPath)) {
-            throw "Staging success record was not found."
-          }
-
-          $record = Get-Content $recordPath -Raw | ConvertFrom-Json
-
-          if ($record.result -ne "success") {
-            throw "Staging record does not indicate success."
-          }
-
-          if ($record.environment -ne "Staging") {
-            throw "Record is not for Staging."
-          }
-
-          if ($record.ci_run_id -ne $env:CI_RUN_ID) {
-            throw "Staging record belongs to a different CI run."
-          }
-
-          if ($record.source_sha -ne $env:SOURCE_SHA) {
-            throw "Staging-tested SHA does not match the requested SHA."
-          }
-
-          $expectedRef = "refs/heads/$env:RELEASE_BRANCH"
-
-          if ($record.source_ref -ne $expectedRef) {
-            throw "Staging-tested branch does not match the requested release branch."
-          }
-
-          Write-Host "Staging verification passed."
-          Write-Host "Verified branch: $($record.source_ref)"
-          Write-Host "Verified commit: $($record.source_sha)"
-
 
       - name: Download exact CI artifact
         uses: actions/download-artifact@v4
