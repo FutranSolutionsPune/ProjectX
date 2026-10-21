@@ -201,8 +201,3 @@ jobs:
           path: ${{ runner.temp }}\staging-passed.json
           if-no-files-found: error
           retention-days: 14
-
-
-
-            throw
-          }
