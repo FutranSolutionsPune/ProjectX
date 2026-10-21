@@ -1,15 +1,18 @@
-
 name: ProjectX CD — Production Deployment
 
 on:
   workflow_dispatch:
     inputs:
       ci_run_id:
-        description: "Successful CI run ID whose artifact passed Staging"
+        description: "CI run ID that produced the artifact tested in Staging"
         required: true
         type: string
       release_branch:
-        description: "Release branch being promoted"
+        description: "Release branch tested in Staging (e.g. release/2026.21)"
+        required: true
+        type: string
+      source_sha:
+        description: "Exact commit SHA whose artifact passed Staging"
         required: true
         type: string
 
@@ -30,12 +33,15 @@ jobs:
       name: Production
 
     steps:
-      - name: Validate release inputs
+      - name: Validate deployment inputs
         shell: powershell
         env:
           CI_RUN_ID: ${{ inputs.ci_run_id }}
           RELEASE_BRANCH: ${{ inputs.release_branch }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ($env:CI_RUN_ID -notmatch '^\d+$') {
             throw "CI run ID must be numeric."
           }
@@ -44,31 +50,37 @@ jobs:
             throw "Expected a release/* branch."
           }
 
-          Write-Host "Release: $env:RELEASE_BRANCH"
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Source SHA must be a full 40-character commit SHA."
+          }
+
+          Write-Host "Release branch: $env:RELEASE_BRANCH"
+          Write-Host "Source commit: $env:SOURCE_SHA"
           Write-Host "Original CI run: $env:CI_RUN_ID"
 
       - name: Download exact CI artifact
         uses: actions/download-artifact@v4
         with:
-          name: ProjectX-${{ github.sha }}
+          name: ProjectX-${{ inputs.source_sha }}
           path: ${{ runner.temp }}\ProjectX-Prod-Package
           run-id: ${{ inputs.ci_run_id }}
           repository: ${{ github.repository }}
           github-token: ${{ github.token }}
 
-      - name: Locate and validate package
+      - name: Validate and extract package
         id: package
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $root = "${{ runner.temp }}\ProjectX-Prod-Package"
-          $zip = Join-Path $root "ProjectX.zip"
+
+          $packageRoot = Join-Path $env:RUNNER_TEMP "ProjectX-Prod-Package"
+          $zip = Join-Path $packageRoot "ProjectX.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "ProjectX-Prod-Extract"
 
           if (!(Test-Path $zip)) {
-            throw "ProjectX.zip was not found in the downloaded artifact."
+            throw "ProjectX.zip was not found in the downloaded CI artifact."
           }
 
-          $extract = Join-Path "${{ runner.temp }}" "ProjectX-Prod-Extract"
           if (Test-Path $extract) {
             Remove-Item $extract -Recurse -Force
           }
@@ -77,7 +89,12 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
           if (!(Test-Path (Join-Path $extract "web.config"))) {
-            throw "Published package is missing web.config."
+            throw "Package is missing web.config."
+          }
+
+          $dlls = @(Get-ChildItem -Path $extract -Filter "*.dll" -File)
+          if ($dlls.Count -eq 0) {
+            throw "Package contains no DLL files."
           }
 
           "extract=$extract" >> $env:GITHUB_OUTPUT
@@ -88,43 +105,49 @@ jobs:
           EXTRACT_PATH: ${{ steps.package.outputs.extract }}
         run: |
           $ErrorActionPreference = "Stop"
+
           Import-Module WebAdministration
 
           $site = "MyProject-PROD"
           $pool = "MyProject-PROD"
           $target = "C:\inetpub\wwwroot\MyProject-PROD"
-          $backup = "C:\inetpub\wwwroot\MyProject-PROD-Previous"
-          $healthUrl = "http://localhost/"
+          $backupRoot = "C:\inetpub\wwwroot\ProjectX-Production-Backups"
+          $backup = Join-Path $backupRoot (Get-Date -Format "yyyyMMdd-HHmmss")
 
           if (!(Test-Path "IIS:\Sites\$site")) {
-            throw "Production IIS site was not found."
+            throw "Production IIS site '$site' was not found."
           }
 
           if (!(Test-Path "IIS:\AppPools\$pool")) {
-            throw "Production app pool was not found."
+            throw "Production app pool '$pool' was not found."
           }
 
-          $hadPrevious = Test-Path (Join-Path $target "web.config")
+          if (!(Test-Path $target)) {
+            throw "Production deployment directory '$target' was not found."
+          }
+
+          New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+
+          $existingFiles = @(Get-ChildItem -Path $target -Force)
+          $hadPreviousFiles = $existingFiles.Count -gt 0
           $backupReady = $false
+          $poolWasStarted = (Get-WebAppPoolState -Name $pool).Value -eq "Started"
 
           try {
-            if ((Get-WebAppPoolState -Name $pool).Value -eq "Started") {
-              Stop-WebAppPool -Name $pool
-            }
-
-            Start-Sleep -Seconds 5
-
-            if ($hadPrevious) {
-              if (Test-Path $backup) {
-                Remove-Item $backup -Recurse -Force
-              }
-
+            if ($hadPreviousFiles) {
               New-Item -ItemType Directory -Path $backup -Force | Out-Null
               Copy-Item "$target\*" $backup -Recurse -Force
               $backupReady = $true
+              Write-Host "Previous deployment backed up to $backup"
             }
 
-            Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
+            if ($poolWasStarted) {
+              Stop-WebAppPool -Name $pool
+            }
+
+            Start-Sleep -Seconds 3
+
+            Get-ChildItem -Path $target -Force |
               Remove-Item -Recurse -Force
 
             Copy-Item "$env:EXTRACT_PATH\*" $target -Recurse -Force
@@ -133,17 +156,24 @@ jobs:
             Start-Website -Name $site
 
             $healthy = $false
+
             for ($i = 1; $i -le 12; $i++) {
               Start-Sleep -Seconds 5
+
               try {
-                $response = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 10
+                $response = Invoke-WebRequest `
+                  -Uri "http://localhost/" `
+                  -UseBasicParsing `
+                  -TimeoutSec 10
+
                 if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
                   $healthy = $true
+                  Write-Host "Production health check returned HTTP $($response.StatusCode)."
                   break
                 }
               }
               catch {
-                Write-Host "Production health check attempt $i failed."
+                Write-Host "Health check attempt $i failed: $($_.Exception.Message)"
               }
             }
 
@@ -152,38 +182,67 @@ jobs:
             }
 
             Write-Host "Production deployment succeeded."
+            Write-Host "Deployed source SHA: ${{ inputs.source_sha }}"
           }
           catch {
-            Write-Host "Deployment failed: $($_.Exception.Message)"
+            $deploymentError = $_.Exception.Message
+            Write-Host "Deployment failed: $deploymentError"
+            Write-Host "Attempting to restore the previous deployment."
 
-            if ((Get-WebAppPoolState -Name $pool).Value -eq "Started") {
-              Stop-WebAppPool -Name $pool
-            }
-            Start-Sleep -Seconds 5
+            try {
+              if ((Get-WebAppPoolState -Name $pool).Value -eq "Started") {
+                Stop-WebAppPool -Name $pool
+              }
 
-            if ($backupReady) {
-              Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
+              Start-Sleep -Seconds 3
+
+              Get-ChildItem -Path $target -Force |
                 Remove-Item -Recurse -Force
 
-              Copy-Item "$backup\*" $target -Recurse -Force
-            }
-            elseif (!$hadPrevious) {
-              Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
-                Remove-Item -Recurse -Force
-            }
-
-            Start-WebAppPool -Name $pool
-            Start-Website -Name $site
-
-            if ($hadPrevious -and $backupReady) {
-              try {
-                $response = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 10
-                Write-Host "Previous files restored; HTTP $($response.StatusCode)."
+              if ($backupReady) {
+                Copy-Item "$backup\*" $target -Recurse -Force
+                Write-Host "Previous deployment files restored."
               }
-              catch {
-                Write-Error "Previous files restored, but recovery health check failed."
+              elseif (!$hadPreviousFiles) {
+                Write-Host "There were no previous deployment files to restore."
+              }
+              else {
+                throw "Backup was not completed; automatic recovery cannot be guaranteed."
+              }
+
+              Start-WebAppPool -Name $pool
+              Start-Website -Name $site
+
+              if ($backupReady) {
+                $recovered = $false
+
+                for ($i = 1; $i -le 6; $i++) {
+                  Start-Sleep -Seconds 5
+                  try {
+                    $response = Invoke-WebRequest `
+                      -Uri "http://localhost/" `
+                      -UseBasicParsing `
+                      -TimeoutSec 10
+
+                    if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                      $recovered = $true
+                      Write-Host "Previous deployment health check passed."
+                      break
+                    }
+                  }
+                  catch {
+                    Write-Host "Recovery health check attempt $i failed."
+                  }
+                }
+
+                if (!$recovered) {
+                  throw "Previous files were restored, but the recovery health check failed."
+                }
               }
             }
+            catch {
+              Write-Host "RECOVERY ERROR: $($_.Exception.Message)"
+            }
 
-            throw
+            throw "Production deployment failed: $deploymentError"
           }
