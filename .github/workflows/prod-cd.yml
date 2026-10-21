@@ -213,7 +213,15 @@ jobs:
 
           "extract=$extract" >> $env:GITHUB_OUTPUT
 
+      - name: Stop after verification-only test
+        if: ${{ inputs.verify_only }}
+        shell: powershell
+        run: |
+          Write-Host "Staging record and artifact validation succeeded."
+          Write-Host "Verification-only mode: Production deployment skipped."
+
       - name: Deploy to Production with recovery
+        if: ${{ !inputs.verify_only }}
         shell: powershell
         env:
           EXTRACT_PATH: ${{ steps.package.outputs.extract }}
