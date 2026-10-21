@@ -164,5 +164,41 @@ jobs:
               }
             }
 
+
+      - name: Record successful Staging deployment
+        shell: powershell
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          CI_RUN_ID: ${{ github.run_id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $record = [ordered]@{
+            source_sha = $env:SOURCE_SHA
+            source_ref = $env:SOURCE_REF
+            ci_run_id  = $env:CI_RUN_ID
+            environment = "Staging"
+            result = "success"
+            verified_at_utc = [DateTime]::UtcNow.ToString("o")
+          }
+
+          $recordPath = Join-Path $env:RUNNER_TEMP "staging-passed.json"
+
+          $record |
+            ConvertTo-Json |
+            Set-Content -Path $recordPath -Encoding UTF8
+
+          Write-Host "Staging success record created for $env:SOURCE_SHA"
+
+      - name: Upload Staging success record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProjectX-Staging-Passed-${{ github.sha }}
+          path: ${{ runner.temp }}\staging-passed.json
+          if-no-files-found: error
+          retention-days: 14
+
+
             throw
           }
