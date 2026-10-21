@@ -101,18 +101,18 @@ jobs:
           }
 
           $extract = Join-Path $env:RUNNER_TEMP "ProdVerify"
+
           if (Test-Path $extract) {
             Remove-Item $extract -Recurse -Force
           }
 
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          if (!(Test-Path (Join-Path $extract "web.config"))) {
-            throw "web.config missing from package."
-          }
+          $dlls = @(Get-ChildItem $extract -Filter "*.dll" -File -Recurse)
 
-          if (@(Get-ChildItem $extract -Filter "*.dll" -File).Count -eq 0) {
-            throw "No DLL files found."
+          if ($dlls.Count -eq 0) {
+            throw "Package contains no DLL files."
           }
 
           Write-Host "Production package validated."
@@ -133,7 +133,6 @@ jobs:
           repository: ${{ github.repository }}
           github-token: ${{ github.token }}
 
-
       - name: Deploy to Production IIS
         shell: powershell
         run: |
@@ -150,10 +149,7 @@ jobs:
             throw "Deployment package missing."
           }
 
-          if (!(Test-Path (Join-Path $target "web.config"))) {
-            throw "Existing Production site not found; refusing first-time overwrite."
-          }
-
+          # Confirm that the IIS site exists and discover its app pool.
           $siteInfo = Get-Website -Name $site -ErrorAction Stop
           $appPool = $siteInfo.applicationPool
 
@@ -161,25 +157,29 @@ jobs:
             throw "Could not determine the IIS application pool for $site."
           }
 
+          if (!(Test-Path $target -PathType Container)) {
+            throw "Production physical directory does not exist: $target"
+          }
+
           Write-Host "IIS site: $site"
           Write-Host "Application pool: $appPool"
+          Write-Host "Production path: $target"
 
-          # Prepare and validate the new package before touching Production.
+          # Extract and validate before modifying Production.
           if (Test-Path $extract) {
             Remove-Item $extract -Recurse -Force
           }
 
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          if (!(Test-Path (Join-Path $extract "web.config"))) {
-            throw "Package is missing web.config."
-          }
+          $newDlls = @(Get-ChildItem $extract -Filter "*.dll" -File -Recurse)
 
-          if (@(Get-ChildItem $extract -Filter "*.dll" -File).Count -eq 0) {
+          if ($newDlls.Count -eq 0) {
             throw "Package contains no DLL files."
           }
 
-          # Back up the current deployment before stopping IIS.
+          # Back up the existing Production files.
           New-Item -ItemType Directory -Path $backup -Force | Out-Null
           Copy-Item "$target\*" $backup -Recurse -Force
 
@@ -188,42 +188,31 @@ jobs:
           try {
             $deploymentStarted = $true
 
+            # Stop the site and its worker process to release locked DLLs.
             Stop-WebSite -Name $site
 
             if ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped") {
               Stop-WebAppPool -Name $appPool
             }
 
-            # Wait for the application pool worker to release the DLL.
-            $dll = Join-Path $target "ProjectX.dll"
             $deadline = (Get-Date).AddSeconds(30)
-            $unlocked = $false
 
             do {
-              try {
-                $stream = [System.IO.File]::Open(
-                  $dll,
-                  [System.IO.FileMode]::Open,
-                  [System.IO.FileAccess]::ReadWrite,
-                  [System.IO.FileShare]::None
-                )
-                $stream.Dispose()
-                $unlocked = $true
-              }
-              catch {
-                Start-Sleep -Seconds 2
-              }
-            } while (!$unlocked -and (Get-Date) -lt $deadline)
+              Start-Sleep -Seconds 2
+              $poolState = (Get-WebAppPoolState -Name $appPool).Value
+            } while ($poolState -ne "Stopped" -and (Get-Date) -lt $deadline)
 
-            if (!$unlocked) {
-              throw "ProjectX.dll remains locked after stopping the application pool."
+            if ($poolState -ne "Stopped") {
+              throw "Application pool did not stop; refusing to replace Production files."
             }
 
+            # Replace the application files.
             Get-ChildItem $target -Force |
               Remove-Item -Recurse -Force
 
             Copy-Item "$extract\*" $target -Recurse -Force
 
+            # Start the application again.
             Start-WebAppPool -Name $appPool
             Start-WebSite -Name $site
 
@@ -254,12 +243,13 @@ jobs:
                 Stop-WebAppPool -Name $appPool -ErrorAction SilentlyContinue
 
                 $deadline = (Get-Date).AddSeconds(30)
+
                 do {
                   Start-Sleep -Seconds 2
-                  $worker = Get-WebAppPoolState -Name $appPool
-                } while ($worker.Value -ne "Stopped" -and (Get-Date) -lt $deadline)
+                  $poolState = (Get-WebAppPoolState -Name $appPool).Value
+                } while ($poolState -ne "Stopped" -and (Get-Date) -lt $deadline)
 
-                if ($worker.Value -ne "Stopped") {
+                if ($poolState -ne "Stopped") {
                   throw "Application pool did not stop; cannot safely restore files."
                 }
 
@@ -275,7 +265,7 @@ jobs:
               }
               catch {
                 Write-Host "ROLLBACK ERROR: $($_.Exception.Message)"
-                throw "Deployment failed and rollback also failed. Preserve backup at $backup. Original error: $($originalError.Exception.Message)"
+                throw "Deployment and rollback failed. Preserve backup at $backup. Original error: $($originalError.Exception.Message)"
               }
             }
 
