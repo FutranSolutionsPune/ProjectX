@@ -154,6 +154,7 @@ jobs:
             Start-WebAppPool -Name $pool
             Start-Sleep -Seconds 5
 
+
             if ($hadPrevious -and $backupReady) {
               try {
                 $response = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 10
@@ -164,6 +165,8 @@ jobs:
               }
             }
 
+            throw
+          }
 
       - name: Record successful Staging deployment
         shell: powershell
@@ -177,7 +180,7 @@ jobs:
           $record = [ordered]@{
             source_sha = $env:SOURCE_SHA
             source_ref = $env:SOURCE_REF
-            ci_run_id  = $env:CI_RUN_ID
+            ci_run_id = $env:CI_RUN_ID
             environment = "Staging"
             result = "success"
             verified_at_utc = [DateTime]::UtcNow.ToString("o")
@@ -198,6 +201,7 @@ jobs:
           path: ${{ runner.temp }}\staging-passed.json
           if-no-files-found: error
           retention-days: 14
+
 
 
             throw
