@@ -1,0 +1,189 @@
+
+name: ProjectX CD — Production Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: "Successful CI run ID whose artifact passed Staging"
+        required: true
+        type: string
+      release_branch:
+        description: "Release branch being promoted"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: projectx-production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy-prod:
+    name: Deploy Approved Artifact to Production
+    runs-on: [self-hosted, Windows, X64, iis, prod]
+
+    environment:
+      name: Production
+
+    steps:
+      - name: Validate release inputs
+        shell: powershell
+        env:
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+        run: |
+          if ($env:CI_RUN_ID -notmatch '^\d+$') {
+            throw "CI run ID must be numeric."
+          }
+
+          if ($env:RELEASE_BRANCH -notmatch '^release/.+') {
+            throw "Expected a release/* branch."
+          }
+
+          Write-Host "Release: $env:RELEASE_BRANCH"
+          Write-Host "Original CI run: $env:CI_RUN_ID"
+
+      - name: Download exact CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-${{ github.sha }}
+          path: ${{ runner.temp }}\ProjectX-Prod-Package
+          run-id: ${{ inputs.ci_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Locate and validate package
+        id: package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = "${{ runner.temp }}\ProjectX-Prod-Package"
+          $zip = Join-Path $root "ProjectX.zip"
+
+          if (!(Test-Path $zip)) {
+            throw "ProjectX.zip was not found in the downloaded artifact."
+          }
+
+          $extract = Join-Path "${{ runner.temp }}" "ProjectX-Prod-Extract"
+          if (Test-Path $extract) {
+            Remove-Item $extract -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          if (!(Test-Path (Join-Path $extract "web.config"))) {
+            throw "Published package is missing web.config."
+          }
+
+          "extract=$extract" >> $env:GITHUB_OUTPUT
+
+      - name: Deploy to Production with recovery
+        shell: powershell
+        env:
+          EXTRACT_PATH: ${{ steps.package.outputs.extract }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          $site = "MyProject-PROD"
+          $pool = "MyProject-PROD"
+          $target = "C:\inetpub\wwwroot\MyProject-PROD"
+          $backup = "C:\inetpub\wwwroot\MyProject-PROD-Previous"
+          $healthUrl = "http://localhost/"
+
+          if (!(Test-Path "IIS:\Sites\$site")) {
+            throw "Production IIS site was not found."
+          }
+
+          if (!(Test-Path "IIS:\AppPools\$pool")) {
+            throw "Production app pool was not found."
+          }
+
+          $hadPrevious = Test-Path (Join-Path $target "web.config")
+          $backupReady = $false
+
+          try {
+            if ((Get-WebAppPoolState -Name $pool).Value -eq "Started") {
+              Stop-WebAppPool -Name $pool
+            }
+
+            Start-Sleep -Seconds 5
+
+            if ($hadPrevious) {
+              if (Test-Path $backup) {
+                Remove-Item $backup -Recurse -Force
+              }
+
+              New-Item -ItemType Directory -Path $backup -Force | Out-Null
+              Copy-Item "$target\*" $backup -Recurse -Force
+              $backupReady = $true
+            }
+
+            Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force
+
+            Copy-Item "$env:EXTRACT_PATH\*" $target -Recurse -Force
+
+            Start-WebAppPool -Name $pool
+            Start-Website -Name $site
+
+            $healthy = $false
+            for ($i = 1; $i -le 12; $i++) {
+              Start-Sleep -Seconds 5
+              try {
+                $response = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 10
+                if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                  $healthy = $true
+                  break
+                }
+              }
+              catch {
+                Write-Host "Production health check attempt $i failed."
+              }
+            }
+
+            if (!$healthy) {
+              throw "Production health check failed."
+            }
+
+            Write-Host "Production deployment succeeded."
+          }
+          catch {
+            Write-Host "Deployment failed: $($_.Exception.Message)"
+
+            if ((Get-WebAppPoolState -Name $pool).Value -eq "Started") {
+              Stop-WebAppPool -Name $pool
+            }
+            Start-Sleep -Seconds 5
+
+            if ($backupReady) {
+              Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force
+
+              Copy-Item "$backup\*" $target -Recurse -Force
+            }
+            elseif (!$hadPrevious) {
+              Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force
+            }
+
+            Start-WebAppPool -Name $pool
+            Start-Website -Name $site
+
+            if ($hadPrevious -and $backupReady) {
+              try {
+                $response = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 10
+                Write-Host "Previous files restored; HTTP $($response.StatusCode)."
+              }
+              catch {
+                Write-Error "Previous files restored, but recovery health check failed."
+              }
+            }
+
+            throw
+          }
