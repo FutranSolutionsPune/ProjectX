@@ -189,7 +189,10 @@ jobs:
             Write-Host "Production deployment and health check succeeded."
           }
           catch {
-            Write-Error "Deployment failed. Attempting rollback."
+            Write-Host "DEPLOYMENT ERROR: $($_.Exception.Message)"
+            Write-Host "Full error details:"
+            Write-Host ($_ | Out-String)
+            Write-Host "Attempting rollback."
             Stop-WebSite -Name $site -ErrorAction SilentlyContinue
 
             Get-ChildItem $target -Force |
