@@ -271,3 +271,121 @@ jobs:
 
             throw $originalError
           }
+
+
+  release:
+    name: Create GitHub Release
+    needs: [verify, deploy]
+    if: ${{ success() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout deployed source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine release version
+        id: version
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+
+          # Reuse a version tag already pointing at this deployed commit.
+          existing=$(git tag --points-at "$SOURCE_SHA" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n 1 || true)
+
+          if [ -n "$existing" ]; then
+            tag_commit=$(git rev-parse "$existing^{commit}")
+            if [ "$tag_commit" != "$SOURCE_SHA" ]; then
+              echo "::error::Existing tag does not match deployed commit."
+              exit 1
+            fi
+
+            echo "tag=$existing" >> "$GITHUB_OUTPUT"
+
+            if gh release view "$existing" >/dev/null 2>&1; then
+              echo "already_published=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "already_published=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          latest=$(git tag --list \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n 1 || true)
+
+          if [ -z "$latest" ]; then
+            version="v1.0.0"
+          else
+            version=$(echo "$latest" | awk -F. \
+              '{printf "v%d.%d.%d", substr($1,2), $2, $3+1}')
+          fi
+
+          echo "tag=$version" >> "$GITHUB_OUTPUT"
+          echo "already_published=false" >> "$GITHUB_OUTPUT"
+
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.already_published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.verify.outputs.release_branch }}
+          VERSION: ${{ steps.version.outputs.tag }}
+          CI_RUN_ID: ${{ needs.verify.outputs.ci_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARTIFACT_NAME="ProjectX-${SOURCE_SHA}"
+          STAGING_RECORD="ProjectX-Staging-Passed-${SOURCE_SHA}"
+          COMMIT_MESSAGE=$(git show -s --format=%s "$SOURCE_SHA")
+
+          echo "=========================================="
+          echo "       PROJECTX PRODUCTION RELEASE"
+          echo "=========================================="
+          echo "Release version       : $VERSION"
+          echo "Release branch        : $SOURCE_BRANCH"
+          echo "Source commit SHA     : $SOURCE_SHA"
+          echo "Latest commit message : $COMMIT_MESSAGE"
+          echo "CI run ID             : $CI_RUN_ID"
+          echo "Production artifact   : $ARTIFACT_NAME"
+          echo "Staging success record: $STAGING_RECORD"
+          echo "Production workflow   : $GITHUB_RUN_ID"
+          echo "=========================================="
+
+          notes="Production deployment and health check succeeded.
+
+          Version: $VERSION
+          Release branch: $SOURCE_BRANCH
+          Source commit: $SOURCE_SHA
+          Commit message: $COMMIT_MESSAGE
+          Production artifact: $ARTIFACT_NAME
+          Staging success record: $STAGING_RECORD
+          CI run: https://github.com/$GH_REPO/actions/runs/$CI_RUN_ID
+          Production workflow run: https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID"
+
+          gh release create "$VERSION" \
+            --target "$SOURCE_SHA" \
+            --title "ProjectX $VERSION - Production Release" \
+            --notes "$notes"
+
+          echo "=========================================="
+          echo "RELEASE PUBLISHED SUCCESSFULLY"
+          echo "Version: $VERSION"
+          echo "Commit : $SOURCE_SHA"
+          echo "=========================================="
+
