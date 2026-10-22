@@ -336,7 +336,15 @@ jobs:
           echo "tag=$version" >> "$GITHUB_OUTPUT"
           echo "already_published=false" >> "$GITHUB_OUTPUT"
 
-
+      - name: Download exact deployed package
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-${{ needs.verify.outputs.source_sha }}
+          path: ${{ runner.temp }}/ReleasePackage
+          run-id: ${{ needs.verify.outputs.ci_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          
       - name: Create GitHub Release
         if: steps.version.outputs.already_published != 'true'
         env:
@@ -388,4 +396,27 @@ jobs:
           echo "Version: $VERSION"
           echo "Commit : $SOURCE_SHA"
           echo "=========================================="
+
+      - name: Attach deployment package to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE="$RUNNER_TEMP/ReleasePackage/ProjectX.zip"
+
+          if [ ! -s "$PACKAGE" ]; then
+            echo "::error::ProjectX.zip not found in the downloaded CI artifact."
+            find "$RUNNER_TEMP/ReleasePackage" -maxdepth 3 -type f
+            exit 1
+          fi
+
+          gh release upload "$VERSION" "$PACKAGE" \
+            --repo "$GH_REPO" \
+            --clobber
+
+          echo "Attached ProjectX.zip to release $VERSION"
 
