@@ -1,0 +1,240 @@
+
+name: Production Release/Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "GitHub Release version to deploy (for example, v1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  download-release:
+    name: Download Selected Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag_commit: ${{ steps.release.outputs.tag_commit }}
+
+    steps:
+      - name: Validate release and download deployment package
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.release_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Use a version such as v1.0.0."
+            exit 1
+          fi
+
+          gh release view "$VERSION" \
+            --repo "$GH_REPO" >/dev/null
+
+          tag_commit=$(gh api \
+            "repos/$GH_REPO/commits/$VERSION" \
+            --jq '.sha')
+
+          if [[ ! "$tag_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve release tag to a commit."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/release"
+
+          gh release download "$VERSION" \
+            --repo "$GH_REPO" \
+            --pattern "ProjectX.zip" \
+            --dir "$RUNNER_TEMP/release"
+
+          if [ ! -s "$RUNNER_TEMP/release/ProjectX.zip" ]; then
+            echo "::error::ProjectX.zip is missing from release $VERSION."
+            exit 1
+          fi
+
+          echo "Selected release : $VERSION"
+          echo "Tag commit       : $tag_commit"
+          echo "Package          : ProjectX.zip"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Upload package for Production job
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-production-release
+          path: ${{ runner.temp }}/release/ProjectX.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    name: Production Approval and Deployment
+    needs: download-release
+    runs-on: [self-hosted, Windows, X64, iis, prod]
+    environment: Production
+
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Download selected release package
+        uses: actions/download-artifact@v4
+        with:
+          name: selected-production-release
+          path: ${{ runner.temp }}\SelectedRelease
+
+      - name: Show selected release
+        shell: powershell
+        env:
+          VERSION: ${{ needs.download-release.outputs.version }}
+          SOURCE_SHA: ${{ needs.download-release.outputs.tag_commit }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=========================================="
+          Write-Host "PRODUCTION RELEASE / ROLLBACK"
+          Write-Host "Release version : $env:VERSION"
+          Write-Host "Tag commit      : $env:SOURCE_SHA"
+          Write-Host "Package         : ProjectX.zip"
+          Write-Host "IIS site        : MyProject-PROD"
+          Write-Host "=========================================="
+
+      - name: Deploy selected release to Production IIS
+        shell: powershell
+        env:
+          VERSION: ${{ needs.download-release.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          $site = "MyProject-PROD"
+          $target = "C:\inetpub\wwwroot\MyProject-PROD"
+          $zip = Join-Path $env:RUNNER_TEMP "SelectedRelease\ProjectX.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "ReleaseDeploy"
+          $backup = "C:\inetpub\wwwroot\MyProject-PROD-backup-${{ github.run_id }}"
+
+          if (!(Test-Path $zip -PathType Leaf)) {
+            throw "Selected release package is missing."
+          }
+
+          $siteInfo = Get-Website -Name $site -ErrorAction Stop
+          $appPool = $siteInfo.applicationPool
+
+          if ([string]::IsNullOrWhiteSpace($appPool)) {
+            throw "Could not determine the IIS application pool."
+          }
+
+          if (!(Test-Path $target -PathType Container)) {
+            throw "Production directory does not exist: $target"
+          }
+
+          if (Test-Path $extract) {
+            Remove-Item $extract -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $extract -Force |
+            Out-Null
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          $dlls = @(Get-ChildItem $extract -Filter "*.dll" -File -Recurse)
+          if ($dlls.Count -eq 0) {
+            throw "Release package contains no DLL files."
+          }
+
+          # Preserve current Production before replacing any files.
+          New-Item -ItemType Directory -Path $backup -Force |
+            Out-Null
+          Copy-Item "$target\*" $backup -Recurse -Force
+
+          $deploymentStarted = $false
+
+          try {
+            $deploymentStarted = $true
+
+            Stop-WebSite -Name $site
+            if ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped") {
+              Stop-WebAppPool -Name $appPool
+            }
+
+            $deadline = (Get-Date).AddSeconds(30)
+            do {
+              Start-Sleep -Seconds 2
+              $poolState = (Get-WebAppPoolState -Name $appPool).Value
+            } while ($poolState -ne "Stopped" -and (Get-Date) -lt $deadline)
+
+            if ($poolState -ne "Stopped") {
+              throw "Application pool did not stop; refusing to replace files."
+            }
+
+            Get-ChildItem $target -Force |
+              Remove-Item -Recurse -Force
+            Copy-Item "$extract\*" $target -Recurse -Force
+
+            Start-WebAppPool -Name $appPool
+            Start-WebSite -Name $site
+            Start-Sleep -Seconds 5
+
+            $response = Invoke-WebRequest `
+              -Uri "http://localhost/" `
+              -UseBasicParsing `
+              -TimeoutSec 20
+
+            if ($response.StatusCode -lt 200 -or
+                $response.StatusCode -ge 400) {
+              throw "Health check returned HTTP $($response.StatusCode)."
+            }
+
+            Write-Host "Deployment and health check succeeded."
+            Write-Host "Deployed release: $env:VERSION"
+            Write-Host "Backup retained at: $backup"
+          }
+          catch {
+            $originalError = $_
+            Write-Host "DEPLOYMENT ERROR: $($originalError.Exception.Message)"
+
+            if ($deploymentStarted) {
+              Write-Host "Attempting rollback from: $backup"
+
+              try {
+                Stop-WebSite -Name $site -ErrorAction SilentlyContinue
+                Stop-WebAppPool -Name $appPool -ErrorAction SilentlyContinue
+
+                $deadline = (Get-Date).AddSeconds(30)
+                do {
+                  Start-Sleep -Seconds 2
+                  $poolState = (Get-WebAppPoolState -Name $appPool).Value
+                } while ($poolState -ne "Stopped" -and (Get-Date) -lt $deadline)
+
+                if ($poolState -ne "Stopped") {
+                  throw "Application pool did not stop; cannot restore backup."
+                }
+
+                Get-ChildItem $target -Force |
+                  Remove-Item -Recurse -Force
+                Copy-Item "$backup\*" $target -Recurse -Force
+
+                Start-WebAppPool -Name $appPool
+                Start-WebSite -Name $site
+
+                Write-Host "Rollback to pre-deployment files completed."
+              }
+              catch {
+                throw "Deployment and automatic rollback failed. Preserve backup at $backup. Rollback error: $($_.Exception.Message)"
+              }
+            }
+
+            throw $originalError
+          }
