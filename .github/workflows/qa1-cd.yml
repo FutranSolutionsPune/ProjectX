@@ -1,0 +1,150 @@
+
+name: ProjectX QA1 CD
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy approved artifact to QA1
+    runs-on: [self-hosted, Windows, X64, iis, dev]
+    environment: QA1
+
+    steps:
+      - name: Download artifact from caller workflow
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-${{ github.sha }}
+          path: ${{ runner.temp }}\qa1-package
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Join-Path $env:RUNNER_TEMP "qa1-package\ProjectX.zip"
+
+          if (!(Test-Path $zip)) {
+            throw "ProjectX.zip not found in the CI artifact."
+          }
+
+          $publish = Join-Path $env:RUNNER_TEMP "qa1-publish"
+          if (Test-Path $publish) {
+            Remove-Item $publish -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $publish -Force | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $publish -Force
+
+          if (!(Test-Path (Join-Path $publish "web.config"))) {
+            throw "web.config is missing."
+          }
+
+          if (!(Get-ChildItem $publish -Filter "*.dll" -File)) {
+            throw "No application DLL found."
+          }
+
+      - name: Deploy to QA1 IIS
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          $site = "ProjectX-QA1"
+          $pool = "ProjectX-QA1"
+          $target = "C:\inetpub\wwwroot\ProjectX-QA1"
+          $publish = Join-Path $env:RUNNER_TEMP "qa1-publish"
+          $backup = Join-Path $env:RUNNER_TEMP "qa1-backup"
+
+          if (!(Test-Path "IIS:\Sites\$site")) {
+            throw "IIS site '$site' does not exist."
+          }
+
+          if (!(Test-Path "IIS:\AppPools\$pool")) {
+            throw "IIS app pool '$pool' does not exist."
+          }
+
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
+
+          if (Test-Path $backup) {
+            Remove-Item $backup -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $backup -Force | Out-Null
+
+          $backupCreated = $false
+
+          try {
+            Stop-Website -Name $site
+            Stop-WebAppPool -Name $pool
+
+            $deadline = (Get-Date).AddSeconds(30)
+            do {
+              Start-Sleep -Seconds 1
+              $state = (Get-WebAppPoolState -Name $pool).Value
+            } while ($state -ne "Stopped" -and (Get-Date) -lt $deadline)
+
+            if ($state -ne "Stopped") {
+              throw "QA1 app pool did not stop."
+            }
+
+            if (Get-ChildItem $target -Force) {
+              Copy-Item "$target\*" $backup -Recurse -Force
+              $backupCreated = $true
+            }
+
+            Get-ChildItem $target -Force |
+              Remove-Item -Recurse -Force
+
+            Copy-Item "$publish\*" $target -Recurse -Force
+
+            Start-WebAppPool -Name $pool
+            Start-Website -Name $site
+
+            $healthy = $false
+            for ($i = 1; $i -le 12; $i++) {
+              try {
+                $response = Invoke-WebRequest `
+                  -Uri "http://localhost:1111/" `
+                  -UseBasicParsing `
+                  -TimeoutSec 5
+
+                if ($response.StatusCode -ge 200 -and
+                    $response.StatusCode -lt 400) {
+                  $healthy = $true
+                  break
+                }
+              } catch {
+                Start-Sleep -Seconds 5
+              }
+            }
+
+            if (!$healthy) {
+              throw "QA1 health check failed on port 1111."
+            }
+
+            Write-Host "QA1 deployment succeeded."
+          }
+          catch {
+            $deploymentError = $_
+
+            Stop-Website -Name $site -ErrorAction SilentlyContinue
+            Stop-WebAppPool -Name $pool -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+
+            Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+            if ($backupCreated) {
+              Copy-Item "$backup\*" $target -Recurse -Force
+            }
+
+            Start-WebAppPool -Name $pool
+            Start-Website -Name $site
+
+            throw $deploymentError
+          }

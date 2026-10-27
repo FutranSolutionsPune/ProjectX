@@ -1,0 +1,171 @@
+
+name: ProjectX CI
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+      - "feature/**"
+      - "epic/**"
+      - "release/**"
+      - "hotfix/**"
+  pull_request:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build, Test and Package
+    runs-on: [self-hosted, Windows, X64, iis, dev]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Locate application project
+        shell: powershell
+        run: |
+          $projects = @(
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter *.csproj -Recurse |
+              Where-Object {
+                $_.FullName -notmatch '[\\/](bin|obj)[\\/]' -and
+                $_.Name -notmatch 'Tests?\.csproj$'
+              }
+          )
+
+          if ($projects.Count -ne 1) {
+            throw "Expected exactly one application .csproj; found $($projects.Count)."
+          }
+
+          "PROJECT_PATH=$($projects[0].FullName)" >> $env:GITHUB_ENV
+          "PROJECT_NAME=$([System.IO.Path]::GetFileNameWithoutExtension($projects[0].Name))" >> $env:GITHUB_ENV
+
+      - name: Restore
+        shell: powershell
+        run: dotnet restore "$env:PROJECT_PATH"
+
+      - name: Build
+        shell: powershell
+        run: dotnet build "$env:PROJECT_PATH" --configuration Release --no-restore
+
+      - name: Run tests
+        shell: powershell
+        run: |
+          $tests = @(
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter *.csproj -Recurse |
+              Where-Object {
+                $_.FullName -notmatch '[\\/](bin|obj)[\\/]' -and
+                $_.Name -match 'Tests?\.csproj$'
+              }
+          )
+
+          if ($tests.Count -eq 0) {
+            Write-Host "No test project found. Test execution skipped."
+          } else {
+            foreach ($test in $tests) {
+              dotnet test "$($test.FullName)" --configuration Release
+              if ($LASTEXITCODE -ne 0) {
+                throw "Tests failed: $($test.Name)"
+              }
+            }
+          }
+
+      - name: Publish application
+        shell: powershell
+        run: |
+          $publish = Join-Path $env:RUNNER_TEMP "ProjectX-publish"
+          if (Test-Path $publish) {
+            Remove-Item $publish -Recurse -Force
+          }
+
+          dotnet publish "$env:PROJECT_PATH" `
+            --configuration Release `
+            --no-build `
+            --output $publish
+
+          if (!(Test-Path (Join-Path $publish "web.config"))) {
+            throw "Publish output is missing web.config."
+          }
+
+          if (!(Test-Path (Join-Path $publish "$env:PROJECT_NAME.dll"))) {
+            throw "Publish output is missing $env:PROJECT_NAME.dll."
+          }
+
+          "PUBLISH_DIR=$publish" >> $env:GITHUB_ENV
+
+      - name: Create deployment package
+        shell: powershell
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "ProjectX.zip"
+          if (Test-Path $zip) {
+            Remove-Item $zip -Force
+          }
+
+          Compress-Archive `
+            -Path "$env:PUBLISH_DIR\*" `
+            -DestinationPath $zip `
+            -CompressionLevel Optimal
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProjectX-${{ github.sha }}
+          path: ${{ runner.temp }}\ProjectX.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  deploy-dev:
+    name: Deploy to DEV
+    needs: build
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop'
+    uses: ./.github/workflows/dev-cd.yml
+    permissions:
+      actions: read
+      contents: read
+
+  
+  deploy-qa2:
+    name: Deploy epic to QA2
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/epic/')
+    uses: ./.github/workflows/qa2-cd.yml
+
+  deploy-qa1:
+    name: Deploy to QA1
+    needs: [build, deploy-dev]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop'
+    uses: ./.github/workflows/qa1-cd.yml
+    permissions:
+      actions: read
+      contents: read
+
+  deploy-staging:
+    name: CD — Deploy Release to Staging
+    needs: build
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/heads/release/')
+    uses: ./.github/workflows/staging-cd.yml
+    permissions:
+      actions: read
+      contents: read

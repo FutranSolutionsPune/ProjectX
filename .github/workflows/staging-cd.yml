@@ -1,0 +1,203 @@
+
+name: ProjectX CD — Staging Deployment
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: projectx-staging-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy-staging:
+    name: Deploy Release to Staging
+    runs-on: [self-hosted, Windows, X64, iis, prod]
+    environment: Staging
+
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-${{ github.sha }}
+          path: ${{ runner.temp }}\ProjectX-Staging-Package
+          run-id: ${{ github.run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Validate package
+        shell: powershell
+        run: |
+          $zip = "${{ runner.temp }}\ProjectX-Staging-Package\ProjectX.zip"
+          if (!(Test-Path $zip)) {
+            throw "ProjectX.zip was not found in the CI artifact."
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            if ($archive.Entries.Count -eq 0) {
+              throw "The deployment ZIP is empty."
+            }
+          }
+          finally {
+            $archive.Dispose()
+          }
+
+      - name: Deploy to Staging with rollback
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Import-Module WebAdministration
+
+          $site = "MyProject-STAGING"
+          $pool = "MyProject-STAGING"
+          $target = "C:\inetpub\wwwroot\MyProject-STAGING"
+          $zip = "${{ runner.temp }}\ProjectX-Staging-Package\ProjectX.zip"
+          $backup = "C:\inetpub\wwwroot\ProjectX-STAGING-Previous"
+          $extract = Join-Path "${{ runner.temp }}" "ProjectX-Staging-Extract"
+          $healthUrl = "http://localhost:8080/"
+
+          if (!(Test-Path "IIS:\Sites\$site")) {
+            throw "IIS site $site does not exist."
+          }
+          if (!(Test-Path $zip)) {
+            throw "Deployment ZIP is missing."
+          }
+
+          if (Test-Path $extract) {
+            Remove-Item $extract -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          if (!(Test-Path (Join-Path $extract "web.config"))) {
+            throw "Published package does not contain web.config."
+          }
+
+          $hadPrevious = Test-Path (Join-Path $target "web.config")
+          $backupReady = $false
+          $stopped = $false
+
+          try {
+            if (Test-Path "IIS:\AppPools\$pool") {
+              if ((Get-WebAppPoolState -Name $pool).Value -eq "Started") {
+                Stop-WebAppPool -Name $pool
+                $stopped = $true
+              }
+            }
+
+            Start-Sleep -Seconds 3
+
+            if ($hadPrevious) {
+              if (Test-Path $backup) {
+                Remove-Item $backup -Recurse -Force
+              }
+              New-Item -ItemType Directory -Path $backup -Force | Out-Null
+              Copy-Item "$target\*" $backup -Recurse -Force
+              $backupReady = $true
+            }
+
+            Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force
+
+            Copy-Item "$extract\*" $target -Recurse -Force
+
+            if ($stopped) {
+              Start-WebAppPool -Name $pool
+              $stopped = $false
+            }
+
+            $healthy = $false
+            for ($i = 1; $i -le 12; $i++) {
+              Start-Sleep -Seconds 5
+              try {
+                $response = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 10
+                if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                  $healthy = $true
+                  break
+                }
+              }
+              catch {
+                Write-Host "Health check attempt $i failed."
+              }
+            }
+
+            if (!$healthy) {
+              throw "Staging health check failed."
+            }
+
+            Write-Host "Staging deployment succeeded."
+          }
+          catch {
+            Write-Host "Deployment failed: $($_.Exception.Message)"
+            Write-Host "Attempting rollback."
+
+            if ((Get-WebAppPoolState -Name $pool).Value -eq "Started") {
+              Stop-WebAppPool -Name $pool
+            }
+            Start-Sleep -Seconds 3
+
+            if ($backupReady) {
+              Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force
+              Copy-Item "$backup\*" $target -Recurse -Force
+            }
+            elseif (!$hadPrevious) {
+              Get-ChildItem $target -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force
+            }
+
+            Start-WebAppPool -Name $pool
+            Start-Sleep -Seconds 5
+
+
+            if ($hadPrevious -and $backupReady) {
+              try {
+                $response = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 10
+                Write-Host "Previous deployment restored; HTTP $($response.StatusCode)."
+              }
+              catch {
+                Write-Error "Rollback completed, but the previous deployment health check failed."
+              }
+            }
+
+            throw
+          }
+
+      - name: Record successful Staging deployment
+        shell: powershell
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          CI_RUN_ID: ${{ github.run_id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $record = [ordered]@{
+            source_sha = $env:SOURCE_SHA
+            source_ref = $env:SOURCE_REF
+            ci_run_id = $env:CI_RUN_ID
+            environment = "Staging"
+            result = "success"
+            verified_at_utc = [DateTime]::UtcNow.ToString("o")
+          }
+
+          $recordPath = Join-Path $env:RUNNER_TEMP "staging-passed.json"
+
+          $record |
+            ConvertTo-Json |
+            Set-Content -Path $recordPath -Encoding UTF8
+
+          Write-Host "Staging success record created for $env:SOURCE_SHA"
+
+      - name: Upload Staging success record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProjectX-Staging-Passed-${{ github.sha }}
+          path: ${{ runner.temp }}\staging-passed.json
+          if-no-files-found: error
+          retention-days: 14

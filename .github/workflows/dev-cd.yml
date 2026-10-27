@@ -1,0 +1,230 @@
+
+name: ProjectX DEV CD
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: projectx-dev-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy artifact to DEV IIS
+    runs-on: [self-hosted, Windows, X64, iis, dev]
+
+    steps:
+      - name: Download CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-${{ github.sha }}
+          path: ${{ runner.temp }}\ProjectX-artifact
+
+      - name: Validate deployment package
+        shell: powershell
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "ProjectX-artifact\ProjectX.zip"
+          if (!(Test-Path $zip)) {
+            throw "Deployment package not found: $zip"
+          }
+
+          $extract = Join-Path $env:RUNNER_TEMP "ProjectX-deploy"
+          if (Test-Path $extract) {
+            Remove-Item $extract -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $extract | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          $webConfig = Join-Path $extract "web.config"
+          if (!(Test-Path $webConfig)) {
+            throw "web.config not found in deployment package."
+          }
+
+          [xml]$config = Get-Content $webConfig -Raw
+
+          # Match the actual published structure, including the location element.
+          $aspNetCore = $config.SelectSingleNode(
+            "/*[local-name()='configuration']/*[local-name()='location']/*[local-name()='system.webServer']/*[local-name()='aspNetCore']"
+          )
+
+          if ($null -eq $aspNetCore) {
+            Write-Host "Published web.config:"
+            Get-Content $webConfig
+            throw "No aspNetCore element found at the expected location in web.config."
+          }
+
+          $arguments = $aspNetCore.GetAttribute("arguments")
+          $processPath = $aspNetCore.GetAttribute("processPath")
+
+          if ($arguments -match '(?i)([^" ]+\.dll)') {
+            $dllName = $Matches[1] -replace '^[.][\\/]', ''
+            $dllPath = Join-Path $extract $dllName
+
+            if (!(Test-Path $dllPath)) {
+              throw "Application DLL '$dllName' referenced by web.config was not found."
+            }
+          }
+          elseif ($processPath -match '(?i)dotnet') {
+            throw "web.config uses dotnet hosting but its application DLL could not be identified from arguments."
+          }
+          elseif (!$processPath) {
+            throw "web.config has neither a usable arguments attribute nor processPath."
+          }
+
+          "DEPLOY_SOURCE=$extract" >> $env:GITHUB_ENV
+
+      - name: Deploy with rollback protection
+        shell: powershell
+        run: |
+          Import-Module WebAdministration -ErrorAction Stop
+
+          $site = "ProjectX-DEV"
+          $pool = "ProjectX-DEV"
+          $destination = "C:\inetpub\wwwroot\ProjectX"
+          $backup = Join-Path $env:RUNNER_TEMP ("ProjectX-backup-" + $env:GITHUB_RUN_ID)
+          $source = $env:DEPLOY_SOURCE
+
+          if (!(Test-Path "IIS:\Sites\$site")) {
+            throw "IIS site '$site' does not exist."
+          }
+
+          if (!(Test-Path "IIS:\AppPools\$pool")) {
+            throw "IIS application pool '$pool' does not exist."
+          }
+
+          if (!(Test-Path $source)) {
+            throw "Deployment source does not exist: $source"
+          }
+
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          New-Item -ItemType Directory -Path $backup -Force | Out-Null
+
+          $hadPreviousFiles = @(Get-ChildItem $destination -Force).Count -gt 0
+
+          if ($hadPreviousFiles) {
+            Copy-Item "$destination\*" $backup -Recurse -Force
+          }
+
+          try {
+            $siteState = (Get-WebSite -Name $site).State
+            if ($siteState -ne "Stopped") {
+              Stop-WebSite -Name $site
+            }
+
+            $poolState = (Get-WebAppPoolState -Name $pool).Value
+            if ($poolState -ne "Stopped") {
+              Stop-WebAppPool -Name $pool
+            }
+
+            # Wait until IIS confirms the application pool has stopped.
+            $poolStopped = $false
+            for ($i = 1; $i -le 30; $i++) {
+              $state = (Get-WebAppPoolState -Name $pool).Value
+              Write-Host "Application pool state: $state"
+
+              if ($state -eq "Stopped") {
+                $poolStopped = $true
+                break
+              }
+
+              Start-Sleep -Seconds 2
+            }
+
+            if (!$poolStopped) {
+              throw "Application pool '$pool' did not stop within 60 seconds."
+            }
+
+            # Allow the worker process to release application file handles.
+            Start-Sleep -Seconds 3
+
+            Get-ChildItem $destination -Force |
+              Remove-Item -Recurse -Force -ErrorAction Stop
+
+            Copy-Item "$source\*" $destination -Recurse -Force -ErrorAction Stop
+
+            Start-WebAppPool -Name $pool -ErrorAction Stop
+            Start-WebSite -Name $site -ErrorAction Stop
+
+            $healthy = $false
+            for ($i = 1; $i -le 12; $i++) {
+              try {
+                $response = Invoke-WebRequest `
+                  -Uri "http://localhost:8085/" `
+                  -UseBasicParsing `
+                  -TimeoutSec 10
+
+                if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                  $healthy = $true
+                  break
+                }
+              }
+              catch {
+                Write-Host "Health check attempt $i failed: $_"
+              }
+
+              Start-Sleep -Seconds 5
+            }
+
+            if (!$healthy) {
+              throw "DEV health check failed at http://localhost:8085/"
+            }
+
+            Write-Host "DEV deployment and health check succeeded."
+          }
+          catch {
+            $deploymentError = $_
+            Write-Error "Deployment failed. Attempting rollback: $deploymentError"
+
+            try {
+              $siteState = (Get-WebSite -Name $site).State
+              if ($siteState -ne "Stopped") {
+                Stop-WebSite -Name $site -ErrorAction SilentlyContinue
+              }
+
+              $poolState = (Get-WebAppPoolState -Name $pool).Value
+              if ($poolState -ne "Stopped") {
+                Stop-WebAppPool -Name $pool -ErrorAction SilentlyContinue
+              }
+
+              $rollbackPoolStopped = $false
+              for ($i = 1; $i -le 30; $i++) {
+                $state = (Get-WebAppPoolState -Name $pool).Value
+                Write-Host "Rollback application pool state: $state"
+
+                if ($state -eq "Stopped") {
+                  $rollbackPoolStopped = $true
+                  break
+                }
+
+                Start-Sleep -Seconds 2
+              }
+
+              if (!$rollbackPoolStopped) {
+                throw "Application pool '$pool' did not stop for rollback."
+              }
+
+              Start-Sleep -Seconds 3
+
+              Get-ChildItem $destination -Force |
+                Remove-Item -Recurse -Force -ErrorAction Stop
+
+              if ($hadPreviousFiles) {
+                Copy-Item "$backup\*" $destination -Recurse -Force -ErrorAction Stop
+              }
+
+              Start-WebAppPool -Name $pool -ErrorAction Stop
+              Start-WebSite -Name $site -ErrorAction Stop
+
+              Write-Host "Rollback file restoration completed. Verify application health."
+            }
+            catch {
+              Write-Error "CRITICAL: Rollback failed: $_"
+            }
+
+            throw "Deployment failed. Original error: $deploymentError"
+          }
