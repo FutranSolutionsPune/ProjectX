@@ -1,0 +1,422 @@
+
+name: ProjectX Production Deployment
+
+on:
+  workflow_run:
+    workflows: ["ProjectX CI"]
+    types: [completed]
+    branches:
+      - "release/**"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Staging Artifact
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, Windows, X64, iis, prod]
+
+    outputs:
+      source_sha: ${{ steps.meta.outputs.source_sha }}
+      release_branch: ${{ steps.meta.outputs.release_branch }}
+      ci_run_id: ${{ steps.meta.outputs.ci_run_id }}
+
+    steps:
+      - name: Capture CI metadata
+        id: meta
+        shell: powershell
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ($env:RELEASE_BRANCH -notmatch '^release/.+') {
+            throw "Not a release branch."
+          }
+
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Invalid commit SHA."
+          }
+
+          "source_sha=$env:SOURCE_SHA" >> $env:GITHUB_OUTPUT
+          "release_branch=$env:RELEASE_BRANCH" >> $env:GITHUB_OUTPUT
+          "ci_run_id=$env:CI_RUN_ID" >> $env:GITHUB_OUTPUT
+
+      - name: Download Staging success record
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-Staging-Passed-${{ github.event.workflow_run.head_sha }}
+          path: ${{ runner.temp }}\StagingRecord
+          run-id: ${{ github.event.workflow_run.id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Verify Staging record
+        shell: powershell
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = Join-Path $env:RUNNER_TEMP "StagingRecord\staging-passed.json"
+
+          if (!(Test-Path $path)) {
+            throw "Staging success record missing."
+          }
+
+          $record = Get-Content $path -Raw | ConvertFrom-Json
+
+          if ($record.result -ne "success" -or
+              $record.environment -ne "Staging" -or
+              "$($record.ci_run_id)" -ne $env:CI_RUN_ID -or
+              $record.source_sha -ne $env:SOURCE_SHA -or
+              $record.source_ref -ne "refs/heads/$env:RELEASE_BRANCH") {
+            throw "Staging record does not match this CI run, branch and commit."
+          }
+
+          Write-Host "Staging record verified."
+
+      - name: Download exact CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-${{ github.event.workflow_run.head_sha }}
+          path: ${{ runner.temp }}\ProdPackage
+          run-id: ${{ github.event.workflow_run.id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Validate package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Join-Path $env:RUNNER_TEMP "ProdPackage\ProjectX.zip"
+
+          if (!(Test-Path $zip)) {
+            throw "ProjectX.zip missing."
+          }
+
+          $extract = Join-Path $env:RUNNER_TEMP "ProdVerify"
+
+          if (Test-Path $extract) {
+            Remove-Item $extract -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          $dlls = @(Get-ChildItem $extract -Filter "*.dll" -File -Recurse)
+
+          if ($dlls.Count -eq 0) {
+            throw "Package contains no DLL files."
+          }
+
+          Write-Host "Production package validated."
+
+  deploy:
+    name: Production Approval and Deployment
+    needs: verify
+    runs-on: [self-hosted, Windows, X64, iis, prod]
+    environment: Production
+
+    steps:
+      - name: Download verified CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-${{ needs.verify.outputs.source_sha }}
+          path: ${{ runner.temp }}\ProdPackage
+          run-id: ${{ needs.verify.outputs.ci_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Deploy to Production IIS
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          $site = "MyProject-PROD"
+          $target = "C:\inetpub\wwwroot\MyProject-PROD"
+          $zip = Join-Path $env:RUNNER_TEMP "ProdPackage\ProjectX.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "ProdDeploy"
+          $backup = "C:\inetpub\wwwroot\MyProject-PROD-backup-${{ github.run_id }}"
+
+          if (!(Test-Path $zip)) {
+            throw "Deployment package missing."
+          }
+
+          # Confirm that the IIS site exists and discover its app pool.
+          $siteInfo = Get-Website -Name $site -ErrorAction Stop
+          $appPool = $siteInfo.applicationPool
+
+          if ([string]::IsNullOrWhiteSpace($appPool)) {
+            throw "Could not determine the IIS application pool for $site."
+          }
+
+          if (!(Test-Path $target -PathType Container)) {
+            throw "Production physical directory does not exist: $target"
+          }
+
+          Write-Host "IIS site: $site"
+          Write-Host "Application pool: $appPool"
+          Write-Host "Production path: $target"
+
+          # Extract and validate before modifying Production.
+          if (Test-Path $extract) {
+            Remove-Item $extract -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          $newDlls = @(Get-ChildItem $extract -Filter "*.dll" -File -Recurse)
+
+          if ($newDlls.Count -eq 0) {
+            throw "Package contains no DLL files."
+          }
+
+          # Back up the existing Production files.
+          New-Item -ItemType Directory -Path $backup -Force | Out-Null
+          Copy-Item "$target\*" $backup -Recurse -Force
+
+          $deploymentStarted = $false
+
+          try {
+            $deploymentStarted = $true
+
+            # Stop the site and its worker process to release locked DLLs.
+            Stop-WebSite -Name $site
+
+            if ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped") {
+              Stop-WebAppPool -Name $appPool
+            }
+
+            $deadline = (Get-Date).AddSeconds(30)
+
+            do {
+              Start-Sleep -Seconds 2
+              $poolState = (Get-WebAppPoolState -Name $appPool).Value
+            } while ($poolState -ne "Stopped" -and (Get-Date) -lt $deadline)
+
+            if ($poolState -ne "Stopped") {
+              throw "Application pool did not stop; refusing to replace Production files."
+            }
+
+            # Replace the application files.
+            Get-ChildItem $target -Force |
+              Remove-Item -Recurse -Force
+
+            Copy-Item "$extract\*" $target -Recurse -Force
+
+            # Start the application again.
+            Start-WebAppPool -Name $appPool
+            Start-WebSite -Name $site
+
+            Start-Sleep -Seconds 5
+
+            $response = Invoke-WebRequest `
+              -Uri "http://localhost/" `
+              -UseBasicParsing `
+              -TimeoutSec 20
+
+            if ($response.StatusCode -lt 200 -or
+                $response.StatusCode -ge 400) {
+              throw "Production health check returned HTTP $($response.StatusCode)."
+            }
+
+            Write-Host "Production deployment and health check succeeded."
+          }
+          catch {
+            $originalError = $_
+            Write-Host "DEPLOYMENT ERROR: $($originalError.Exception.Message)"
+            Write-Host ($originalError | Out-String)
+
+            if ($deploymentStarted) {
+              Write-Host "Attempting rollback from: $backup"
+
+              try {
+                Stop-WebSite -Name $site -ErrorAction SilentlyContinue
+                Stop-WebAppPool -Name $appPool -ErrorAction SilentlyContinue
+
+                $deadline = (Get-Date).AddSeconds(30)
+
+                do {
+                  Start-Sleep -Seconds 2
+                  $poolState = (Get-WebAppPoolState -Name $appPool).Value
+                } while ($poolState -ne "Stopped" -and (Get-Date) -lt $deadline)
+
+                if ($poolState -ne "Stopped") {
+                  throw "Application pool did not stop; cannot safely restore files."
+                }
+
+                Get-ChildItem $target -Force |
+                  Remove-Item -Recurse -Force
+
+                Copy-Item "$backup\*" $target -Recurse -Force
+
+                Start-WebAppPool -Name $appPool
+                Start-WebSite -Name $site
+
+                Write-Host "Rollback completed."
+              }
+              catch {
+                Write-Host "ROLLBACK ERROR: $($_.Exception.Message)"
+                throw "Deployment and rollback failed. Preserve backup at $backup. Original error: $($originalError.Exception.Message)"
+              }
+            }
+
+            throw $originalError
+          }
+
+
+  release:
+    name: Create GitHub Release
+    needs: [verify, deploy]
+    if: ${{ success() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout deployed source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine release version
+        id: version
+        env:
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags origin
+
+          # Reuse a version tag already pointing at this deployed commit.
+          existing=$(git tag --points-at "$SOURCE_SHA" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n 1 || true)
+
+          if [ -n "$existing" ]; then
+            tag_commit=$(git rev-parse "$existing^{commit}")
+            if [ "$tag_commit" != "$SOURCE_SHA" ]; then
+              echo "::error::Existing tag does not match deployed commit."
+              exit 1
+            fi
+
+            echo "tag=$existing" >> "$GITHUB_OUTPUT"
+
+            if gh release view "$existing" >/dev/null 2>&1; then
+              echo "already_published=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "already_published=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          latest=$(git tag --list \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n 1 || true)
+
+          if [ -z "$latest" ]; then
+            version="v1.0.0"
+          else
+            version=$(echo "$latest" | awk -F. \
+              '{printf "v%d.%d.%d", substr($1,2), $2, $3+1}')
+          fi
+
+          echo "tag=$version" >> "$GITHUB_OUTPUT"
+          echo "already_published=false" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact deployed package
+        uses: actions/download-artifact@v4
+        with:
+          name: ProjectX-${{ needs.verify.outputs.source_sha }}
+          path: ${{ runner.temp }}/ReleasePackage
+          run-id: ${{ needs.verify.outputs.ci_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          
+      - name: Create GitHub Release
+        if: steps.version.outputs.already_published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.verify.outputs.release_branch }}
+          VERSION: ${{ steps.version.outputs.tag }}
+          CI_RUN_ID: ${{ needs.verify.outputs.ci_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARTIFACT_NAME="ProjectX-${SOURCE_SHA}"
+          STAGING_RECORD="ProjectX-Staging-Passed-${SOURCE_SHA}"
+          COMMIT_MESSAGE=$(git show -s --format=%s "$SOURCE_SHA")
+
+          echo "=========================================="
+          echo "       PROJECTX PRODUCTION RELEASE"
+          echo "=========================================="
+          echo "Release version       : $VERSION"
+          echo "Release branch        : $SOURCE_BRANCH"
+          echo "Source commit SHA     : $SOURCE_SHA"
+          echo "Latest commit message : $COMMIT_MESSAGE"
+          echo "CI run ID             : $CI_RUN_ID"
+          echo "Production artifact   : $ARTIFACT_NAME"
+          echo "Staging success record: $STAGING_RECORD"
+          echo "Production workflow   : $GITHUB_RUN_ID"
+          echo "=========================================="
+
+          notes="Production deployment and health check succeeded.
+
+          Version: $VERSION
+          Release branch: $SOURCE_BRANCH
+          Source commit: $SOURCE_SHA
+          Commit message: $COMMIT_MESSAGE
+          Production artifact: $ARTIFACT_NAME
+          Staging success record: $STAGING_RECORD
+          CI run: https://github.com/$GH_REPO/actions/runs/$CI_RUN_ID
+          Production workflow run: https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID"
+
+          gh release create "$VERSION" \
+            --target "$SOURCE_SHA" \
+            --title "ProjectX $VERSION - Production Release" \
+            --notes "$notes"
+
+          echo "=========================================="
+          echo "RELEASE PUBLISHED SUCCESSFULLY"
+          echo "Version: $VERSION"
+          echo "Commit : $SOURCE_SHA"
+          echo "=========================================="
+
+      - name: Attach deployment package to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE="$RUNNER_TEMP/ReleasePackage/ProjectX.zip"
+
+          if [ ! -s "$PACKAGE" ]; then
+            echo "::error::ProjectX.zip not found in the downloaded CI artifact."
+            find "$RUNNER_TEMP/ReleasePackage" -maxdepth 3 -type f
+            exit 1
+          fi
+
+          gh release upload "$VERSION" "$PACKAGE" \
+            --repo "$GH_REPO" \
+            --clobber
+
+          echo "Attached ProjectX.zip to release $VERSION"
+
