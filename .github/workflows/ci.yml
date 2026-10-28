@@ -4,16 +4,21 @@ name: ProjectX CI
 on:
   push:
     branches:
-      - develop
       - main
+      - develop
       - "feature/**"
       - "epic/**"
       - "release/**"
       - "hotfix/**"
+    tags:
+      - "qa1-*"
+      - "qa2-*"
+
   pull_request:
     branches:
       - develop
       - main
+
   workflow_dispatch:
 
 permissions:
@@ -32,6 +37,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
@@ -90,6 +97,7 @@ jobs:
         shell: powershell
         run: |
           $publish = Join-Path $env:RUNNER_TEMP "ProjectX-publish"
+
           if (Test-Path $publish) {
             Remove-Item $publish -Recurse -Force
           }
@@ -98,6 +106,10 @@ jobs:
             --configuration Release `
             --no-build `
             --output $publish
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Application publish failed."
+          }
 
           if (!(Test-Path (Join-Path $publish "web.config"))) {
             throw "Publish output is missing web.config."
@@ -113,6 +125,7 @@ jobs:
         shell: powershell
         run: |
           $zip = Join-Path $env:RUNNER_TEMP "ProjectX.zip"
+
           if (Test-Path $zip) {
             Remove-Item $zip -Force
           }
@@ -122,6 +135,12 @@ jobs:
             -DestinationPath $zip `
             -CompressionLevel Optimal
 
+          if (!(Test-Path $zip)) {
+            throw "Deployment package was not created."
+          }
+
+          "ARTIFACT_NAME=ProjectX-${{ github.sha }}" >> $env:GITHUB_ENV
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -130,41 +149,54 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # MAIN: automatically deploy the build to DEV.
   deploy-dev:
-    name: Deploy to DEV
+    name: ProjectX DEV CD
     needs: build
     if: >-
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/develop'
+      github.ref == 'refs/heads/main'
     uses: ./.github/workflows/dev-cd.yml
     permissions:
       actions: read
       contents: read
 
-  
-  deploy-qa2:
-    name: Deploy epic to QA2
-    needs: build
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/epic/')
-    uses: ./.github/workflows/qa2-cd.yml
-
+  # QA1: a pushed qa1-* tag triggers CI, then QA1 CD.
   deploy-qa1:
-    name: Deploy to QA1
-    needs: [build, deploy-dev]
+    name: ProjectX QA1 CD
+    needs: build
     if: >-
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/develop'
+      startsWith(github.ref, 'refs/tags/qa1-')
     uses: ./.github/workflows/qa1-cd.yml
     permissions:
       actions: read
       contents: read
 
-  deploy-staging:
-    name: CD — Deploy Release to Staging
+  # QA2: a pushed qa2-* tag triggers CI, then QA2 CD.
+  deploy-qa2:
+    name: ProjectX QA2 CD
     needs: build
     if: >-
       github.event_name == 'push' &&
-      startsWith(github.ref, 'refs/heads/release/')
+      startsWith(github.ref, 'refs/tags/qa2-')
+    uses: ./.github/workflows/qa2-cd.yml
+    permissions:
+      actions: read
+      contents: read
+
+  # Either successful QA deployment can proceed to shared Staging.
+  deploy-staging:
+    name: ProjectX Staging CD
+    needs:
+      - deploy-qa1
+      - deploy-qa2
+    if: >-
+      always() &&
+      (
+        needs.deploy-qa1.result == 'success' ||
+        needs.deploy-qa2.result == 'success'
+      )
     uses: ./.github/workflows/staging-cd.yml
     permissions:
       actions: read
