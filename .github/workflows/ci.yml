@@ -153,7 +153,8 @@ jobs:
     needs: build
     if: >-
       github.event_name == 'push' &&
-      github.ref == 'refs/heads/main'
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/heads/maintenance/')
     uses: ./.github/workflows/dev-cd.yml
     permissions:
       actions: read
