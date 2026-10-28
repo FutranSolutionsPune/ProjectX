@@ -5,19 +5,17 @@ on:
   push:
     branches:
       - main
-      - develop
       - "feature/**"
-      - "epic/**"
-      - "release/**"
       - "hotfix/**"
+      - maintenance/**
     tags:
       - "qa1-*"
       - "qa2-*"
 
   pull_request:
     branches:
-      - develop
       - main
+      - 'maintenance/**'
 
   workflow_dispatch:
 
