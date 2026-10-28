@@ -5,8 +5,6 @@ on:
   workflow_run:
     workflows: ["ProjectX CI"]
     types: [completed]
-    branches:
-      - "release/**"
 
 permissions:
   actions: read
@@ -15,12 +13,17 @@ permissions:
 jobs:
   verify:
     name: Verify Staging Artifact
-    if: github.event.workflow_run.conclusion == 'success'
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      (
+        startsWith(github.event.workflow_run.head_branch, 'qa1-') ||
+        startsWith(github.event.workflow_run.head_branch, 'qa2-')
+      )
     runs-on: [self-hosted, Windows, X64, iis, prod]
 
     outputs:
       source_sha: ${{ steps.meta.outputs.source_sha }}
-      release_branch: ${{ steps.meta.outputs.release_branch }}
+      source_tag: ${{ steps.meta.outputs.source_tag }}
       ci_run_id: ${{ steps.meta.outputs.ci_run_id }}
 
     steps:
@@ -29,13 +32,13 @@ jobs:
         shell: powershell
         env:
           SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
-          RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_TAG: ${{ github.event.workflow_run.head_branch }}
           CI_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ($env:RELEASE_BRANCH -notmatch '^release/.+') {
-            throw "Not a release branch."
+          if ($env:SOURCE_TAG -notmatch '^qa[12]-.+') {
+            throw "Expected a QA1 or QA2 deployment tag, but received '$env:SOURCE_TAG'."
           }
 
           if ($env:SOURCE_SHA -notmatch '^[0-9a-fA-F]{40}$') {
@@ -43,7 +46,7 @@ jobs:
           }
 
           "source_sha=$env:SOURCE_SHA" >> $env:GITHUB_OUTPUT
-          "release_branch=$env:RELEASE_BRANCH" >> $env:GITHUB_OUTPUT
+          "source_tag=$env:SOURCE_TAG" >> $env:GITHUB_OUTPUT
           "ci_run_id=$env:CI_RUN_ID" >> $env:GITHUB_OUTPUT
 
       - name: Download Staging success record
@@ -59,7 +62,7 @@ jobs:
         shell: powershell
         env:
           SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
-          RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_TAG: ${{ github.event.workflow_run.head_branch }}
           CI_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -75,8 +78,8 @@ jobs:
               $record.environment -ne "Staging" -or
               "$($record.ci_run_id)" -ne $env:CI_RUN_ID -or
               $record.source_sha -ne $env:SOURCE_SHA -or
-              $record.source_ref -ne "refs/heads/$env:RELEASE_BRANCH") {
-            throw "Staging record does not match this CI run, branch and commit."
+              $record.source_ref -ne "refs/tags/$env:SOURCE_TAG") {
+            throw "Staging record does not match this CI run, tag and commit."
           }
 
           Write-Host "Staging record verified."
@@ -149,7 +152,6 @@ jobs:
             throw "Deployment package missing."
           }
 
-          # Confirm that the IIS site exists and discover its app pool.
           $siteInfo = Get-Website -Name $site -ErrorAction Stop
           $appPool = $siteInfo.applicationPool
 
@@ -165,7 +167,6 @@ jobs:
           Write-Host "Application pool: $appPool"
           Write-Host "Production path: $target"
 
-          # Extract and validate before modifying Production.
           if (Test-Path $extract) {
             Remove-Item $extract -Recurse -Force
           }
@@ -179,7 +180,6 @@ jobs:
             throw "Package contains no DLL files."
           }
 
-          # Back up the existing Production files.
           New-Item -ItemType Directory -Path $backup -Force | Out-Null
           Copy-Item "$target\*" $backup -Recurse -Force
 
@@ -188,7 +188,6 @@ jobs:
           try {
             $deploymentStarted = $true
 
-            # Stop the site and its worker process to release locked DLLs.
             Stop-WebSite -Name $site
 
             if ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped") {
@@ -206,13 +205,11 @@ jobs:
               throw "Application pool did not stop; refusing to replace Production files."
             }
 
-            # Replace the application files.
             Get-ChildItem $target -Force |
               Remove-Item -Recurse -Force
 
             Copy-Item "$extract\*" $target -Recurse -Force
 
-            # Start the application again.
             Start-WebAppPool -Name $appPool
             Start-WebSite -Name $site
 
@@ -272,11 +269,12 @@ jobs:
             throw $originalError
           }
 
-
   release:
     name: Create GitHub Release
     needs: [verify, deploy]
-    if: ${{ success() }}
+    if: >-
+      needs.verify.result == 'success' &&
+      needs.deploy.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -300,7 +298,6 @@ jobs:
           set -euo pipefail
           git fetch --tags origin
 
-          # Reuse a version tag already pointing at this deployed commit.
           existing=$(git tag --points-at "$SOURCE_SHA" \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
             | sort -V | tail -n 1 || true)
@@ -344,14 +341,14 @@ jobs:
           run-id: ${{ needs.verify.outputs.ci_run_id }}
           repository: ${{ github.repository }}
           github-token: ${{ github.token }}
-          
+
       - name: Create GitHub Release
         if: steps.version.outputs.already_published != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
-          SOURCE_BRANCH: ${{ needs.verify.outputs.release_branch }}
+          SOURCE_TAG: ${{ needs.verify.outputs.source_tag }}
           VERSION: ${{ steps.version.outputs.tag }}
           CI_RUN_ID: ${{ needs.verify.outputs.ci_run_id }}
         shell: bash
@@ -366,7 +363,7 @@ jobs:
           echo "       PROJECTX PRODUCTION RELEASE"
           echo "=========================================="
           echo "Release version       : $VERSION"
-          echo "Release branch        : $SOURCE_BRANCH"
+          echo "Source tag            : $SOURCE_TAG"
           echo "Source commit SHA     : $SOURCE_SHA"
           echo "Latest commit message : $COMMIT_MESSAGE"
           echo "CI run ID             : $CI_RUN_ID"
@@ -378,7 +375,7 @@ jobs:
           notes="Production deployment and health check succeeded.
 
           Version: $VERSION
-          Release branch: $SOURCE_BRANCH
+          Source tag: $SOURCE_TAG
           Source commit: $SOURCE_SHA
           Commit message: $COMMIT_MESSAGE
           Production artifact: $ARTIFACT_NAME
@@ -419,4 +416,3 @@ jobs:
             --clobber
 
           echo "Attached ProjectX.zip to release $VERSION"
-
